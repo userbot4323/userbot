@@ -38,7 +38,6 @@ from io import BytesIO
 from pathlib import Path
 from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont
-from openai import OpenAI
 from telethon.tl import functions
 from telethon.tl.functions.messages import ReportRequest
 # Army features ke liye imports
