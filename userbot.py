@@ -1,5 +1,21 @@
 import os
 import json
+import subprocess
+from collections import Counter, defaultdict
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
+import img2pdf
+from PyPDF2 import PdfReader, PdfWriter
+from telethon.tl.functions.messages import GetHistoryRequest
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.users import GetFullUserRequest
+import tempfile
+import shutil
+import pytz
+import sys
+import urllib.parse 
+import textwrap
+from collections import Counter
+from io import BytesIO
 import threading
 import colorsys
 import qrcode
@@ -22,6 +38,7 @@ from io import BytesIO
 from pathlib import Path
 from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont
+from openai import OpenAI
 from telethon.tl import functions
 from telethon.tl.functions.messages import ReportRequest
 # Army features ke liye imports
@@ -69,28 +86,238 @@ from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, update
 import yt_dlp
 import ffmpeg
 import edge_tts
-#fixed
+
+
 asyncio.set_event_loop(asyncio.new_event_loop())
 
 # Create logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# ----------------- CONFIG -----------------s
-API_ID    = 27896193
-API_HASH  = "38a5463cb8bf980d4519fba0ced298c2"
-OWNER_ID = None
-SESSION_STRING = "1BJWap1sBu08WqsdFanTeXTicXOP8F4ZCtSwIGgFSBx1SBm-9yAh0t8Xlf4tubuJcKQ8BYnyXkdd1yhsH_UJQbFOSsYFWT5aXQ6GntwZxZKh7_pV5d8XqMhdN-WsKzhMeaWX2ZxJpKBVaCbIoCwz_t-24k3TeZFrs-g0ll15D9mDRixc308tji-Gevv04604lhKqJV-fYIxFKVuln2Dmay8TcQQroXcFtXEJf1Lja-gfKokHeGkYcJ4mPMoRA5Uxs_w2mlcZHHgfIPPSYP0RpqT3B6tB3bQnJvK049FD3XuYDC4rQioXGImTa5FfIUHmXBai01UCbEAc86hbOyxHDRG3on5tW6Jc="
-MUTED_FILE = "muted.json"
-STATE_FILE = "state.json"
-GBAN_FILE = "gban_list.json"
-STORAGE_FILE = "user_replies.json" 
-PORT = 10000  # port for web server (if needed)
+# ----------------- CONFIG -----------------
+API_ID         = 27896193
+API_HASH       = "38a5463cb8bf980d4519fba0ced298c2"
+OWNER_ID       = 6105009337
+MUTED_FILE     = "muted.json"
+STATE_FILE     = "state.json"
+SESSION_NAMES = [
+    "session1",   # Pehla account
+    "session2",   # Doosra account
+    "session3",
+    "session4",
+    "session5",
+    "session6",
+    "session7",
+    "session8"
+]
+GBAN_FILE      = "gban_list.json"
+STORAGE_FILE   = "user_replies.json"
+PORT           = 10000
 os.environ["PATH"] += r";C:\ffmpeg\bin"
 os.environ["PATH"] += r";C:\ffprobe\bin"
 # ------------------------------------------
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+clients = [
+    TelegramClient(name, API_ID, API_HASH)
+    for name in SESSION_NAMES
+]
+ 
+# Pehla client default rakhte hain backward compatibility ke liye
+# (agar code mein kahi `client` directly use hua ho)
+client = clients[0]
+
+def register_all_handlers():
+    """
+    Pehle client ke saare event handlers
+    baaki clients pe bhi register karta hai.
+    
+    Yeh main() call karne se PEHLE bulao.
+    """
+    # Pehle client ke registered callbacks lete hain
+    base_handlers = clients[0].list_event_handlers()
+    
+    # Baaki sabhi clients pe same handlers lagao
+    for c in clients[1:]:
+        for callback, event in base_handlers:
+            c.add_event_handler(callback, event)
+    
+    print(f"✅ {len(base_handlers)} handlers registered on {len(clients)} sessions")
+
+def owner_only(func):
+    """Decorator to restrict command to owner only and delete command message"""
+    async def wrapper(event):
+        if event.sender_id != OWNER_ID:
+            return
+        # Delete the command message
+        try:
+            await event.delete()
+        except:
+            pass
+        # Execute the command
+        await func(event)
+    return wrapper
+
+# ==================== HELPER FUNCTIONS ====================
+
+async def get_words_definition(word):
+    """Get dictionary definition"""
+    try:
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            definitions = []
+            for meaning in data[0]["meanings"]:
+                part_of_speech = meaning["partOfSpeech"]
+                for definition in meaning["definitions"]:
+                    definitions.append(f"📖 **{part_of_speech}**: {definition['definition']}")
+            return "\n\n".join(definitions[:5])
+        return "Word not found in dictionary."
+    except:
+        return "Error fetching definition."
+
+async def get_urban_definition(word):
+    """Get Urban Dictionary definition"""
+    try:
+        url = f"https://api.urbandictionary.com/v0/define?term={word}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data["list"]:
+                item = data["list"][0]
+                definition = item["definition"].replace("[", "").replace("]", "")
+                example = item["example"].replace("[", "").replace("]", "")
+                return f"**📚 Urban Dictionary: {word}**\n\n**Definition:**\n{definition[:1000]}\n\n**Example:**\n{example[:500]}"
+            return "No definition found on Urban Dictionary."
+        return "Error fetching Urban Dictionary."
+    except:
+        return "Error fetching Urban Dictionary."
+
+def uwuify(text):
+    """Convert text to uwu speak"""
+    text = text.replace("r", "w").replace("l", "w")
+    text = text.replace("R", "W").replace("L", "W")
+    text = re.sub(r"n([aeiou])", r"ny\1", text, flags=re.I)
+    text = re.sub(r"N([aeiou])", r"Ny\1", text, flags=re.I)
+    text = text.replace("ove", "uv")
+    return text + " ✨ uwu"
+
+def mock_text(text):
+    """Convert text to mocking SpongeBob case"""
+    result = ""
+    upper = False
+    for char in text:
+        if char.isalpha():
+            result += char.upper() if upper else char.lower()
+            upper = not upper
+        else:
+            result += char
+    return result
+
+def vaporwave(text):
+    """Convert text to vaporwave aesthetic"""
+    normal = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    wide = "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ０１２３４５６７８９"
+    trans = str.maketrans(normal, wide)
+    return text.translate(trans)
+
+def weebify(text):
+    """Convert text to Japanese aesthetic"""
+    normal = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    weeb = "卂乃匚刀乇下厶卄工丁长乚从𠘨口尸㔿尺丂丅凵リ山乂丫乙卂乃匚刀乇下厶卄工丁长乚从𠘨口尸㔿尺丂丅凵リ山乂丫乙"
+    trans = str.maketrans(normal, weeb)
+    return text.translate(trans)
+
+def flip_text(text):
+    """Flip text upside down"""
+    normal = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!?.,'\""
+    flipped = "∀qƆpƎℲפHIſʞ⅂WNOdQɹS⊥∩ΛMX⅄Zɐqɔpǝɟɓɥıɾʞlɯuodbɹsʇnʌʍxʎz0⇂2Ɛ4ϛ9ㄥ86¡¿˙'„"
+    trans = str.maketrans(normal, flipped)
+    return text[::-1].translate(trans)
+
+async def search_lyrics(song_query):
+    """Search for lyrics by song name"""
+    try:
+        # Try with just song name
+        search_url = f"https://api.lyrics.ovh/v1/{urllib.parse.quote(song_query)}"
+        
+        response = requests.get(search_url)
+        if response.status_code == 200:
+            data = response.json()
+            lyrics = data["lyrics"]
+            if len(lyrics) > 4000:
+                lyrics = lyrics[:4000] + "\n\n... (truncated)"
+            return f"**🎵 {song_query}**\n\n{lyrics}"
+        
+        # Try splitting artist and song if format is "Artist - Song"
+        if " - " in song_query:
+            artist, song = song_query.split(" - ", 1)
+            search_url = f"https://api.lyrics.ovh/v1/{urllib.parse.quote(artist.strip())}/{urllib.parse.quote(song.strip())}"
+            response = requests.get(search_url)
+            if response.status_code == 200:
+                data = response.json()
+                lyrics = data["lyrics"]
+                if len(lyrics) > 4000:
+                    lyrics = lyrics[:4000] + "\n\n... (truncated)"
+                return f"**🎵 {artist.strip()} - {song.strip()}**\n\n{lyrics}"
+        
+        return f"❌ Lyrics not found for '{song_query}'.\nTry format: .lyrics Artist - Song Title"
+    except Exception as e:
+        return f"Error fetching lyrics: {str(e)}"
+
+async def paste_to_nekobin(text):
+    """Paste text to nekobin"""
+    try:
+        url = "https://nekobin.com/api/documents"
+        response = requests.post(url, json={"content": text})
+        if response.status_code == 201:
+            data = response.json()
+            key = data["result"]["key"]
+            return f"https://nekobin.com/{key}"
+        return "Error pasting to nekobin."
+    except:
+        return "Error pasting to nekobin."
+
+def generate_lorem(paragraphs=1):
+    """Generate Lorem Ipsum text"""
+    lorem = """Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."""
+    return "\n\n".join([lorem] * paragraphs)
+
+# ==================== TRUTH AND DARE ====================
+
+TRUTHS = [
+    "What's the most embarrassing thing you've ever done?",
+    "Have you ever lied to your best friend?",
+    "What's your biggest fear?",
+    "What's the worst date you've ever been on?",
+    "Have you ever stolen anything?",
+    "What's a secret you've never told anyone?",
+    "Who was your first crush?",
+    "Have you ever cheated on a test?",
+    "What's the most trouble you've ever been in?",
+    "What's something you're ashamed of?",
+]
+
+DARES = [
+    "Send a voice message singing your favorite song!",
+    "Text your crush something embarrassing!",
+    "Do 10 pushups right now!",
+    "Change your profile picture to something silly for an hour!",
+    "Send a message using only emojis!",
+    "Tell a joke in the group!",
+    "Share your most recent photo!",
+    "Say something in a different language!",
+    "Post 'I love you' in the group!",
+    "Do your best animal impression in voice!",
+]
+
+SHAYARIS = [
+    "तेरे बिना ज़िंदगी से कोई शिकवा तो नहीं,\nतेरे बिना ज़िंदगी भी लेकिन ज़िंदगी तो नहीं।",
+    "हम तो समझे थे कि बरसों का है ये बंधन प्यार का,\nतुमने तोड़ा तो पता चला धागा कच्चा था।",
+    "हज़ारों साल नर्गिस अपनी बेनूरी पे रोती है,\nबड़ी मुश्किल से होता है चमन में दीदा-वर पैदा।",
+    "दिल ही तो है न संग-ओ-ख़िश्त दर्द से भर न आए क्यों,\nरोएंगे हम हज़ार बार कोई हमें सताए क्यों।",
+    "कभी किसी को मुकम्मल जहाँ नहीं मिलता,\nकहीं ज़मीन कहीं आसमाँ नहीं मिलता।",
+]
 
 # ----------------- VC MUSIC CLASS -----------------
 class VCMusicPlayer:
@@ -598,6 +825,1803 @@ async def delete_from_muted(event):
     # Global variables for reaction and tag tasks
 react_task = None
 tag_task = None
+
+# Create temp directory
+TEMP_DIR = "temp_converter"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Decorator for owner-only commands
+def owner_only(func):
+    async def wrapper(event):
+        if event.sender_id != OWNER_ID:
+            return
+        try:
+            await event.delete()
+        except:
+            pass
+        await func(event)
+    return wrapper
+
+# ==================== HELPER FUNCTIONS ====================
+
+async def download_media(event, file_name=None):
+    """Download replied media/file"""
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        if reply_msg.media:
+            if not file_name:
+                if reply_msg.file and reply_msg.file.name:
+                    file_name = reply_msg.file.name
+                else:
+                    ext = ""
+                    if reply_msg.photo:
+                        ext = ".jpg"
+                    elif reply_msg.video:
+                        ext = ".mp4"
+                    elif reply_msg.document:
+                        if reply_msg.document.mime_type:
+                            if "pdf" in reply_msg.document.mime_type:
+                                ext = ".pdf"
+                            elif "image" in reply_msg.document.mime_type:
+                                ext = ".jpg"
+                            elif "video" in reply_msg.document.mime_type:
+                                ext = ".mp4"
+                    file_name = f"file_{reply_msg.id}{ext}"
+            
+            file_path = os.path.join(TEMP_DIR, file_name)
+            await client.download_media(reply_msg, file=file_path)
+            return file_path, file_name, reply_msg
+    return None, None, None
+
+def get_file_size(file_path):
+    """Get file size in MB"""
+    size_bytes = os.path.getsize(file_path)
+    return size_bytes / (1024 * 1024)
+
+async def upload_and_send(event, file_path, caption=""):
+    """Upload file and send to chat"""
+    try:
+        await client.send_file(
+            event.chat_id,
+            file_path,
+            caption=caption,
+            force_document=True
+        )
+        return True
+    except Exception as e:
+        await client.send_message(event.chat_id, f"❌ Upload failed: {str(e)[:100]}")
+        return False
+
+def cleanup_temp_files():
+    """Clean old temp files"""
+    try:
+        for file in os.listdir(TEMP_DIR):
+            file_path = os.path.join(TEMP_DIR, file)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+    except:
+        pass
+
+# ==================== CONVERTER COMMANDS ====================
+
+@client.on(events.NewMessage(pattern=r"\.2pdf$"))
+@owner_only
+async def to_pdf_cmd(event):
+    """Convert image/document to PDF"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to an image or document!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Converting to PDF...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        pdf_path = file_path.rsplit('.', 1)[0] + '.pdf'
+        
+        # Check if it's an image
+        if reply_msg.photo or (reply_msg.document and 'image' in reply_msg.document.mime_type):
+            # Convert image to PDF
+            image = Image.open(file_path)
+            
+            if image.mode in ('RGBA', 'LA', 'P'):
+                # Convert to RGB
+                rgb_image = Image.new('RGB', image.size, (255, 255, 255))
+                rgb_image.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
+                image = rgb_image
+            
+            # Save as PDF
+            pdf_bytes = img2pdf.convert(image.filename)
+            with open(pdf_path, 'wb') as f:
+                f.write(pdf_bytes)
+                
+        elif reply_msg.document and 'pdf' in reply_msg.document.mime_type:
+            # Already PDF
+            pdf_path = file_path
+        else:
+            await status_msg.edit("❌ Unsupported file type! Reply to an image.")
+            os.remove(file_path)
+            return
+        
+        pdf_size = get_file_size(pdf_path)
+        
+        await status_msg.edit("✅ PDF created! Uploading...")
+        await upload_and_send(event, pdf_path, f"📄 Converted to PDF\nSize: {pdf_size:.2f} MB")
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Conversion failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.2jpg$"))
+@owner_only
+async def to_jpg_cmd(event):
+    """Convert image to JPG"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to an image!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Converting to JPG...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        # Open and convert image
+        image = Image.open(file_path)
+        
+        jpg_path = file_path.rsplit('.', 1)[0] + '.jpg'
+        
+        # Convert RGBA to RGB
+        if image.mode in ('RGBA', 'LA', 'P'):
+            rgb_image = Image.new('RGB', image.size, (255, 255, 255))
+            rgb_image.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
+            image = rgb_image
+        
+        # Save as JPG with quality
+        image.save(jpg_path, 'JPEG', quality=85, optimize=True)
+        
+        jpg_size = get_file_size(jpg_path)
+        original_size = get_file_size(file_path)
+        
+        await status_msg.edit("✅ JPG created! Uploading...")
+        await upload_and_send(event, jpg_path, f"🖼️ Converted to JPG\nOriginal: {original_size:.2f} MB\nJPG: {jpg_size:.2f} MB")
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Conversion failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.2png$"))
+@owner_only
+async def to_png_cmd(event):
+    """Convert image to PNG"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to an image!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Converting to PNG...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        image = Image.open(file_path)
+        png_path = file_path.rsplit('.', 1)[0] + '.png'
+        
+        # Save as PNG
+        image.save(png_path, 'PNG', optimize=True)
+        
+        png_size = get_file_size(png_path)
+        original_size = get_file_size(file_path)
+        
+        await status_msg.edit("✅ PNG created! Uploading...")
+        await upload_and_send(event, png_path, f"🖼️ Converted to PNG\nOriginal: {original_size:.2f} MB\nPNG: {png_size:.2f} MB")
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Conversion failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.2webp$"))
+@owner_only
+async def to_webp_cmd(event):
+    """Convert image to WebP (Sticker format)"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to an image!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Converting to WebP...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        image = Image.open(file_path)
+        webp_path = file_path.rsplit('.', 1)[0] + '.webp'
+        
+        # Resize for sticker if too large
+        max_size = 512
+        if image.width > max_size or image.height > max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        # Convert RGBA to RGB if needed
+        if image.mode == 'RGBA':
+            rgb_image = Image.new('RGB', image.size, (255, 255, 255))
+            rgb_image.paste(image, mask=image.split()[3])
+            image = rgb_image
+        
+        # Save as WebP
+        image.save(webp_path, 'WEBP', quality=80, method=6)
+        
+        webp_size = get_file_size(webp_path)
+        
+        await status_msg.edit("✅ WebP created! Uploading...")
+        
+        # Send as both document and sticker
+        await client.send_file(
+            event.chat_id,
+            webp_path,
+            caption=f"🎯 Converted to WebP\nSize: {webp_size:.2f} MB\n\n_Use this as Telegram sticker!_",
+            force_document=True
+        )
+        
+        # Also send as sticker
+        await client.send_file(
+            event.chat_id,
+            webp_path,
+            force_document=False
+        )
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Conversion failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.2mp3$"))
+@owner_only
+async def to_mp3_cmd(event):
+    """Convert video to MP3 audio"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to a video or audio file!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Converting to MP3...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        mp3_path = file_path.rsplit('.', 1)[0] + '.mp3'
+        
+        # Check if ffmpeg is installed
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        except:
+            await status_msg.edit("❌ FFmpeg not installed!\nInstall: `apt install ffmpeg`")
+            return
+        
+        # Convert to MP3 using ffmpeg
+        cmd = [
+            'ffmpeg', '-i', file_path,
+            '-vn',  # No video
+            '-acodec', 'libmp3lame',
+            '-ab', '192k',  # Bitrate
+            '-ar', '44100',  # Sample rate
+            '-y',  # Overwrite
+            mp3_path
+        ]
+        
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if process.returncode != 0:
+            await status_msg.edit(f"❌ FFmpeg error: {process.stderr[:200]}")
+            return
+        
+        mp3_size = get_file_size(mp3_path)
+        original_size = get_file_size(file_path)
+        
+        await status_msg.edit("✅ MP3 created! Uploading...")
+        
+        # Send as audio file
+        await client.send_file(
+            event.chat_id,
+            mp3_path,
+            caption=f"🎵 Converted to MP3\nOriginal: {original_size:.2f} MB\nMP3: {mp3_size:.2f} MB",
+            attributes=[DocumentAttributeFilename('audio.mp3')],
+            supports_streaming=True
+        )
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Conversion failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.2mp4$"))
+@owner_only
+async def to_mp4_cmd(event):
+    """Convert any video format to MP4"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to a video!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Converting to MP4...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        mp4_path = file_path.rsplit('.', 1)[0] + '_converted.mp4'
+        
+        # Check if already MP4
+        if file_path.lower().endswith('.mp4'):
+            await status_msg.edit("❌ File is already MP4!")
+            return
+        
+        # Check ffmpeg
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        except:
+            await status_msg.edit("❌ FFmpeg not installed!")
+            return
+        
+        # Convert to MP4
+        cmd = [
+            'ffmpeg', '-i', file_path,
+            '-c:v', 'libx264',  # Video codec
+            '-c:a', 'aac',  # Audio codec
+            '-movflags', '+faststart',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-y',
+            mp4_path
+        ]
+        
+        await status_msg.edit("🔄 Converting video (this may take time)...")
+        
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if process.returncode != 0:
+            await status_msg.edit(f"❌ FFmpeg error: {process.stderr[:200]}")
+            return
+        
+        mp4_size = get_file_size(mp4_path)
+        
+        await status_msg.edit("✅ MP4 created! Uploading...")
+        
+        await client.send_file(
+            event.chat_id,
+            mp4_path,
+            caption=f"🎬 Converted to MP4\nSize: {mp4_size:.2f} MB",
+            supports_streaming=True
+        )
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Conversion failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.2gif$"))
+@owner_only
+async def to_gif_cmd(event):
+    """Convert video to GIF"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to a video!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Converting to GIF...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        gif_path = file_path.rsplit('.', 1)[0] + '.gif'
+        
+        # Check ffmpeg
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        except:
+            await status_msg.edit("❌ FFmpeg not installed!")
+            return
+        
+        await status_msg.edit("🔄 Creating GIF (max 10 seconds)...")
+        
+        # Convert to GIF (max 10 seconds, 10 fps, 320p)
+        cmd = [
+            'ffmpeg', '-i', file_path,
+            '-t', '10',  # Max 10 seconds
+            '-vf', 'fps=10,scale=320:-1:flags=lanczos',
+            '-loop', '0',
+            '-y',
+            gif_path
+        ]
+        
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if process.returncode != 0:
+            await status_msg.edit(f"❌ FFmpeg error: {process.stderr[:200]}")
+            return
+        
+        gif_size = get_file_size(gif_path)
+        
+        # Check if GIF is too large (>10MB)
+        if gif_size > 10:
+            await status_msg.edit(f"⚠️ GIF too large ({gif_size:.2f} MB). Trying smaller size...")
+            
+            # Try smaller scale
+            cmd2 = [
+                'ffmpeg', '-i', file_path,
+                '-t', '5',  # 5 seconds
+                '-vf', 'fps=8,scale=240:-1:flags=lanczos',
+                '-loop', '0',
+                '-y',
+                gif_path
+            ]
+            subprocess.run(cmd2, capture_output=True)
+            gif_size = get_file_size(gif_path)
+        
+        await status_msg.edit("✅ GIF created! Uploading...")
+        
+        await client.send_file(
+            event.chat_id,
+            gif_path,
+            caption=f"🎞️ Converted to GIF\nSize: {gif_size:.2f} MB"
+        )
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Conversion failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.compress(?:\s+(\d+))?"))
+@owner_only
+async def compress_cmd(event):
+    """Compress image/video"""
+    quality = int(event.pattern_match.group(1)) if event.pattern_match and event.pattern_match.group(1) else 50
+    
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to an image or video!\nUsage: .compress [quality 1-100]")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, f"🔄 Compressing (quality: {quality})...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path:
+        await status_msg.edit("❌ Could not download file!")
+        return
+    
+    try:
+        original_size = get_file_size(file_path)
+        
+        if reply_msg.photo or (reply_msg.document and 'image' in reply_msg.document.mime_type):
+            # Compress image
+            compressed_path = file_path.rsplit('.', 1)[0] + '_compressed.jpg'
+            
+            image = Image.open(file_path)
+            
+            # Convert RGBA to RGB
+            if image.mode in ('RGBA', 'LA', 'P'):
+                rgb_image = Image.new('RGB', image.size, (255, 255, 255))
+                rgb_image.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
+                image = rgb_image
+            
+            # Save with compression
+            image.save(compressed_path, 'JPEG', quality=quality, optimize=True)
+            
+            compressed_size = get_file_size(compressed_path)
+            reduction = ((original_size - compressed_size) / original_size) * 100
+            
+            await status_msg.edit("✅ Image compressed! Uploading...")
+            await upload_and_send(
+                event, 
+                compressed_path, 
+                f"🗜️ Compressed Image\nOriginal: {original_size:.2f} MB\nCompressed: {compressed_size:.2f} MB\nReduced by: {reduction:.1f}%"
+            )
+            
+        elif reply_msg.video or (reply_msg.document and 'video' in reply_msg.document.mime_type):
+            # Compress video
+            compressed_path = file_path.rsplit('.', 1)[0] + '_compressed.mp4'
+            
+            # Check ffmpeg
+            try:
+                subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            except:
+                await status_msg.edit("❌ FFmpeg not installed!")
+                return
+            
+            await status_msg.edit("🔄 Compressing video (this may take time)...")
+            
+            # Calculate CRF based on quality (inverse: low CRF = high quality)
+            crf = int(51 - (quality * 0.51))  # 0-51 scale
+            crf = max(18, min(51, crf))  # 18-51 range
+            
+            cmd = [
+                'ffmpeg', '-i', file_path,
+                '-c:v', 'libx264',
+                '-crf', str(crf),
+                '-preset', 'medium',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-movflags', '+faststart',
+                '-y',
+                compressed_path
+            ]
+            
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                await status_msg.edit(f"❌ FFmpeg error: {process.stderr[:200]}")
+                return
+            
+            compressed_size = get_file_size(compressed_path)
+            reduction = ((original_size - compressed_size) / original_size) * 100
+            
+            await status_msg.edit("✅ Video compressed! Uploading...")
+            await client.send_file(
+                event.chat_id,
+                compressed_path,
+                caption=f"🗜️ Compressed Video\nOriginal: {original_size:.2f} MB\nCompressed: {compressed_size:.2f} MB\nReduced by: {reduction:.1f}%",
+                supports_streaming=True
+            )
+        else:
+            await status_msg.edit("❌ Reply to an image or video!")
+            return
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Compression failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.mergepdf$"))
+@owner_only
+async def mergepdf_cmd(event):
+    """Merge multiple images into single PDF"""
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to images (album) to merge into PDF!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Merging images to PDF...")
+    
+    try:
+        reply_msg = await event.get_reply_message()
+        
+        image_paths = []
+        
+        if reply_msg.grouped_id:
+            # Album - multiple images
+            messages = await client.get_messages(event.chat_id, ids=[reply_msg.id])
+            async for msg in client.iter_messages(event.chat_id, offset_id=reply_msg.id, reverse=True):
+                if msg.grouped_id == reply_msg.grouped_id:
+                    if msg.photo:
+                        file_path = os.path.join(TEMP_DIR, f"merge_{msg.id}.jpg")
+                        await client.download_media(msg, file=file_path)
+                        image_paths.append(file_path)
+        else:
+            # Single image
+            if reply_msg.photo:
+                file_path = os.path.join(TEMP_DIR, f"merge_{reply_msg.id}.jpg")
+                await client.download_media(reply_msg, file=file_path)
+                image_paths.append(file_path)
+            else:
+                await status_msg.edit("❌ Reply to images!")
+                return
+        
+        if not image_paths:
+            await status_msg.edit("❌ No images found!")
+            return
+        
+        await status_msg.edit(f"🔄 Processing {len(image_paths)} images...")
+        
+        # Convert images to PDF
+        pdf_path = os.path.join(TEMP_DIR, "merged_output.pdf")
+        
+        with open(pdf_path, 'wb') as f:
+            f.write(img2pdf.convert(image_paths))
+        
+        pdf_size = get_file_size(pdf_path)
+        
+        await status_msg.edit("✅ PDF created! Uploading...")
+        await upload_and_send(event, pdf_path, f"📚 Merged PDF\nPages: {len(image_paths)}\nSize: {pdf_size:.2f} MB")
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Merge failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+
+@client.on(events.NewMessage(pattern=r"\.splitpdf(?:\s+(\d+))?"))
+@owner_only
+async def splitpdf_cmd(event):
+    """Split PDF pages"""
+    pages_per_file = int(event.pattern_match.group(1)) if event.pattern_match and event.pattern_match.group(1) else 1
+    
+    if not event.reply_to_msg_id:
+        await client.send_message(event.chat_id, "❌ Reply to a PDF file!\nUsage: .splitpdf [pages_per_file]")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, f"🔄 Splitting PDF (every {pages_per_file} page(s))...")
+    
+    file_path, file_name, reply_msg = await download_media(event)
+    
+    if not file_path or not file_path.endswith('.pdf'):
+        await status_msg.edit("❌ Reply to a PDF file!")
+        return
+    
+    try:
+        reader = PdfReader(file_path)
+        total_pages = len(reader.pages)
+        
+        await status_msg.edit(f"📄 Total pages: {total_pages}\n🔄 Splitting...")
+        
+        split_files = []
+        
+        for i in range(0, total_pages, pages_per_file):
+            writer = PdfWriter()
+            end = min(i + pages_per_file, total_pages)
+            
+            for page_num in range(i, end):
+                writer.add_page(reader.pages[page_num])
+            
+            split_path = os.path.join(TEMP_DIR, f"split_part_{i//pages_per_file + 1}.pdf")
+            
+            with open(split_path, 'wb') as f:
+                writer.write(f)
+            
+            split_files.append(split_path)
+        
+        await status_msg.edit(f"✅ Split into {len(split_files)} PDFs! Uploading...")
+        
+        # Upload all split files
+        for idx, split_file in enumerate(split_files, 1):
+            file_size = get_file_size(split_file)
+            await upload_and_send(
+                event,
+                split_file,
+                f"📑 Split PDF Part {idx}/{len(split_files)}\nSize: {file_size:.2f} MB"
+            )
+            await asyncio.sleep(1)
+        
+        await status_msg.delete()
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Split failed: {str(e)[:100]}")
+    
+    finally:
+        cleanup_temp_files()
+        
+COIN_IDS = {
+    "BTC": "bitcoin",
+    "BITCOIN": "bitcoin",
+    "ETH": "ethereum",
+    "ETHEREUM": "ethereum",
+    "TON": "the-open-network",
+    "TONCOIN": "the-open-network",
+    "BNB": "binancecoin",
+    "BINANCE": "binancecoin",
+    "SOL": "solana",
+    "SOLANA": "solana",
+    "LTC": "litecoin",
+    "LITECOIN": "litecoin",
+    "XRP": "ripple",
+    "RIPPLE": "ripple",
+    "DOGE": "dogecoin",
+    "DOGECOIN": "dogecoin",
+    "ADA": "cardano",
+    "CARDANO": "cardano",
+    "DOT": "polkadot",
+    "POLKADOT": "polkadot",
+    "MATIC": "matic-network",
+    "POLYGON": "matic-network",
+    "AVAX": "avalanche-2",
+    "AVALANCHE": "avalanche-2",
+    "TRX": "tron",
+    "TRON": "tron",
+    "LINK": "chainlink",
+    "CHAINLINK": "chainlink",
+    "UNI": "uniswap",
+    "UNISWAP": "uniswap",
+    "ATOM": "cosmos",
+    "COSMOS": "cosmos",
+    "XLM": "stellar",
+    "STELLAR": "stellar",
+    "ALGO": "algorand",
+    "ALGORAND": "algorand",
+    "VET": "vechain",
+    "VECHAIN": "vechain",
+    "THETA": "theta-token",
+    "FIL": "filecoin",
+    "FILECOIN": "filecoin",
+    "SAND": "the-sandbox",
+    "MANA": "decentraland",
+    "AXS": "axie-infinity",
+    "GALA": "gala",
+    "ENJ": "enjincoin",
+    "BAT": "basic-attention-token",
+    "ZEC": "zcash",
+    "DASH": "dash",
+    "NEO": "neo",
+    "EOS": "eos",
+    "XTZ": "tezos",
+    "KSM": "kusama",
+    "CAKE": "pancakeswap-token",
+    "BAKE": "bakerytoken",
+    "1INCH": "1inch",
+    "AAVE": "aave",
+    "COMP": "compound-governance-token",
+    "MKR": "maker",
+    "SNX": "havven",
+    "CRV": "curve-dao-token",
+    "SUSHI": "sushi",
+    "YFI": "yearn-finance",
+    "ZIL": "zilliqa",
+    "KAVA": "kava",
+    "BAND": "band-protocol",
+    "OCEAN": "ocean-protocol",
+    "GRT": "the-graph",
+    "REN": "republic-protocol",
+    "STORJ": "storj",
+    "ANKR": "ankr",
+    "COTI": "coti",
+    "CHZ": "chiliz",
+    "HBAR": "hedera-hashgraph",
+    "IOTA": "iota",
+    "WAVES": "waves",
+    "ICX": "icon",
+    "ONT": "ontology",
+    "QTUM": "qtum",
+    "RVN": "ravencoin",
+    "HOT": "holotoken",
+    "ZRX": "0x",
+    "BTT": "bittorrent",
+    "WIN": "wink",
+    "DENT": "dent",
+    "CELR": "celer-network",
+    "FET": "fetch-ai",
+    "AGIX": "singularitynet",
+}
+
+@client.on(events.NewMessage(pattern=r"\.crypto(?:\s+(.+))?"))
+@owner_only
+async def crypto_cmd(event):
+    """Get cryptocurrency price and stats"""
+    
+    # Get coin symbol from command or replied message
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        coin_symbol = reply_msg.text.strip().upper() if reply_msg.text else ""
+    else:
+        coin_symbol = event.pattern_match.group(1).strip().upper() if event.pattern_match and event.pattern_match.group(1) else ""
+    
+    if not coin_symbol:
+        await client.send_message(
+            event.chat_id,
+            "❌ **Usage:** `.crypto BTC` or `.crypto ETH`\n\n"
+            "**Supported coins:** BTC, ETH, TON, BNB, SOL, LTC, XRP, DOGE, ADA, DOT, MATIC, AVAX, TRX, LINK, UNI, ATOM, XLM, ALGO, VET, FIL, SAND, MANA, AXS, GALA, CAKE, AAVE, COMP, MKR, SNX, CRV, SUSHI, YFI, ZIL, GRT, CHZ, HBAR, IOTA, WAVES, RVN, HOT, ZRX, BTT, DENT, FET, AGIX"
+        )
+        return
+    
+    # Check if coin is supported
+    if coin_symbol not in COIN_IDS:
+        await client.send_message(event.chat_id, f"❌ **{coin_symbol}** not found in supported list!")
+        return
+    
+    coin_id = COIN_IDS[coin_symbol]
+    
+    status_msg = await client.send_message(event.chat_id, f"🔄 Fetching **{coin_symbol}** price...")
+    
+    try:
+        # Fetch data from CoinGecko API
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "market_data": "true",
+            "community_data": "true",
+            "developer_data": "false",
+            "sparkline": "true"
+        }
+        
+        response = requests.get(url, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            name = data.get("name", coin_symbol)
+            symbol = data.get("symbol", "").upper()
+            market_data = data.get("market_data", {})
+            
+            # Price data
+            current_price = market_data.get("current_price", {}).get("usd", 0)
+            price_change_24h = market_data.get("price_change_24h", 0)
+            price_change_percentage_24h = market_data.get("price_change_percentage_24h", 0)
+            price_change_percentage_7d = market_data.get("price_change_percentage_7d", 0)
+            price_change_percentage_30d = market_data.get("price_change_percentage_30d", 0)
+            
+            # Market data
+            market_cap = market_data.get("market_cap", {}).get("usd", 0)
+            market_cap_rank = market_data.get("market_cap_rank", "N/A")
+            total_volume = market_data.get("total_volume", {}).get("usd", 0)
+            high_24h = market_data.get("high_24h", {}).get("usd", 0)
+            low_24h = market_data.get("low_24h", {}).get("usd", 0)
+            
+            # Supply data
+            circulating_supply = market_data.get("circulating_supply", 0)
+            total_supply = market_data.get("total_supply", 0)
+            max_supply = market_data.get("max_supply", 0)
+            
+            # ATH data
+            ath = market_data.get("ath", {}).get("usd", 0)
+            ath_change_percentage = market_data.get("ath_change_percentage", {}).get("usd", 0)
+            ath_date = market_data.get("ath_date", {}).get("usd", "")
+            
+            # Format numbers
+            def format_price(price):
+                if price >= 1:
+                    return f"${price:,.2f}"
+                elif price >= 0.01:
+                    return f"${price:,.4f}"
+                elif price >= 0.0001:
+                    return f"${price:,.6f}"
+                else:
+                    return f"${price:,.8f}"
+            
+            def format_large(num):
+                if num >= 1_000_000_000:
+                    return f"${num/1_000_000_000:.2f}B"
+                elif num >= 1_000_000:
+                    return f"${num/1_000_000:.2f}M"
+                elif num >= 1_000:
+                    return f"${num/1_000:.2f}K"
+                else:
+                    return f"${num:,.0f}"
+            
+            # Determine arrow and color emoji
+            if price_change_percentage_24h > 0:
+                change_emoji = "🟢 📈"
+                change_sign = "+"
+            elif price_change_percentage_24h < 0:
+                change_emoji = "🔴 📉"
+                change_sign = ""
+            else:
+                change_emoji = "⚪ ➡️"
+                change_sign = ""
+            
+            # Create response message
+            if ath_date:
+                ath_date_parsed = datetime.fromisoformat(ath_date.replace("Z", "+00:00"))
+                ath_date_str = ath_date_parsed.strftime("%d %b %Y")
+            else:
+                ath_date_str = "N/A"
+            
+            message = f"""**💰 {name} ({symbol})** {change_emoji}
+            
+╭━━━━━━━━━━━━━━━━━━━━━━╮
+┃  **Current Price:** {format_price(current_price)}
+┃  **24h Change:** {change_sign}{price_change_percentage_24h:.2f}%
+┃  **7d Change:** {change_sign if price_change_percentage_7d >= 0 else ''}{price_change_percentage_7d:.2f}%
+┃  **30d Change:** {change_sign if price_change_percentage_30d >= 0 else ''}{price_change_percentage_30d:.2f}%
+╰━━━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━━━━━━━━━━━━━━━━━━╮
+┃  **📊 Market Stats**
+┃  Market Cap: {format_large(market_cap)}
+┃  Market Rank: #{market_cap_rank}
+┃  24h Volume: {format_large(total_volume)}
+┃  24h High/Low: {format_price(high_24h)} / {format_price(low_24h)}
+╰━━━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━━━━━━━━━━━━━━━━━━╮
+┃  **📈 Supply**
+┃  Circulating: {format_large(circulating_supply).replace('$','')} {symbol}
+┃  Total Supply: {format_large(total_supply).replace('$','') if total_supply else '∞'} {symbol}
+┃  Max Supply: {format_large(max_supply).replace('$','') if max_supply else '∞'} {symbol}
+╰━━━━━━━━━━━━━━━━━━━━━━╯
+
+╭━━━━━━━━━━━━━━━━━━━━━━╮
+┃  **🏆 All Time High**
+┃  ATH: {format_price(ath)}
+┃  ATH Change: {ath_change_percentage:.2f}%
+┃  ATH Date: {ath_date_str}
+╰━━━━━━━━━━━━━━━━━━━━━━╯
+
+🔄 **Last Updated:** {datetime.now().strftime('%H:%M:%S %d-%m-%Y')}"""
+            
+            await status_msg.edit(message)
+            
+        elif response.status_code == 429:
+            await status_msg.edit("⏳ **Rate limited!** Please wait a minute and try again.")
+        else:
+            await status_msg.edit(f"❌ **Error fetching data:** {response.status_code}")
+            
+    except Exception as e:
+        await status_msg.edit(f"❌ **Error:** {str(e)[:100]}")
+
+# ==================== STATS COMMANDS ====================
+
+@client.on(events.NewMessage(pattern=r"\.topmembers(?:\s+(\d+))?"))
+@owner_only
+async def topmembers_cmd(event):
+    """Show most active members in current group"""
+    if event.is_private:
+        await client.send_message(event.chat_id, "❌ Use this command in a group!")
+        return
+    
+    limit = int(event.pattern_match.group(1)) if event.pattern_match and event.pattern_match.group(1) else 10
+    limit = min(limit, 25)  # Max 25 members
+    
+    status_msg = await client.send_message(event.chat_id, f"🔄 Analyzing last 1000 messages...")
+    
+    try:
+        # Get last 1000 messages
+        messages = []
+        async for msg in client.iter_messages(event.chat_id, limit=1000):
+            if msg.sender_id and not msg.sender_id == 777000:  # Exclude Telegram service
+                messages.append(msg.sender_id)
+        
+        if not messages:
+            await status_msg.edit("❌ No messages found!")
+            return
+        
+        # Count messages per user
+        user_counts = Counter(messages)
+        top_users = user_counts.most_common(limit)
+        
+        # Build response
+        response = f"**📊 Top {limit} Most Active Members**\n\n"
+        response += "╭━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for i, (user_id, count) in enumerate(top_users, 1):
+            try:
+                user = await client.get_entity(user_id)
+                name = user.first_name or "Unknown"
+                if user.last_name:
+                    name += f" {user.last_name}"
+                
+                # Truncate long names
+                if len(name) > 20:
+                    name = name[:17] + "..."
+                
+                medal = medals[i-1] if i <= 3 else f"{i}."
+                percentage = (count / len(messages)) * 100
+                
+                response += f"┃  {medal} **{name}** - {count} msgs ({percentage:.1f}%)\n"
+            except:
+                response += f"┃  {i}. **User {user_id}** - {count} msgs\n"
+        
+        response += "╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+        response += f"📁 **Total Messages Analyzed:** {len(messages)}"
+        
+        await status_msg.edit(response)
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {str(e)[:100]}")
+
+@client.on(events.NewMessage(pattern=r"\.topchats(?:\s+(\d+))?"))
+@owner_only
+async def topchats_cmd(event):
+    """Show most active chats"""
+    limit = int(event.pattern_match.group(1)) if event.pattern_match and event.pattern_match.group(1) else 10
+    limit = min(limit, 20)
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Analyzing all chats...")
+    
+    try:
+        chat_stats = {}
+        total_messages = 0
+        
+        async for dialog in client.iter_dialogs():
+            if dialog.is_group or dialog.is_channel:
+                chat_id = dialog.id
+                chat_name = dialog.name
+                
+                # Count recent messages (last 7 days)
+                message_count = 0
+                seven_days_ago = datetime.now() - timedelta(days=7)
+                
+                try:
+                    async for msg in client.iter_messages(chat_id, limit=500):
+                        if msg.date.replace(tzinfo=None) > seven_days_ago:
+                            message_count += 1
+                        else:
+                            break
+                except:
+                    message_count = 0
+                
+                chat_stats[chat_name] = message_count
+                total_messages += message_count
+        
+        # Sort by message count
+        sorted_chats = sorted(chat_stats.items(), key=lambda x: x[1], reverse=True)[:limit]
+        
+        response = f"**📊 Top {limit} Most Active Chats (Last 7 Days)**\n\n"
+        response += "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for i, (chat_name, count) in enumerate(sorted_chats, 1):
+            medal = medals[i-1] if i <= 3 else f"{i}."
+            
+            # Truncate long names
+            if len(chat_name) > 25:
+                chat_name = chat_name[:22] + "..."
+            
+            response += f"┃  {medal} **{chat_name}**\n"
+            response += f"┃     └─ {count} messages\n"
+        
+        response += "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+        response += f"📁 **Total Messages:** {total_messages}"
+        
+        await status_msg.edit(response)
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {str(e)[:100]}")
+
+@client.on(events.NewMessage(pattern=r"\.topwords(?:\s+(\d+))?"))
+@owner_only
+async def topwords_cmd(event):
+    """Show most used words globally"""
+    limit = int(event.pattern_match.group(1)) if event.pattern_match and event.pattern_match.group(1) else 25
+    limit = min(limit, 50)
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Analyzing messages from all chats...")
+    
+    try:
+        all_words = []
+        total_messages = 0
+        
+        async for dialog in client.iter_dialogs():
+            if dialog.is_group or dialog.is_channel:
+                try:
+                    async for msg in client.iter_messages(dialog.id, limit=200):
+                        if msg.text:
+                            total_messages += 1
+                            # Extract words (3+ letters)
+                            words = re.findall(r'\b[a-zA-Z]{3,}\b', msg.text.lower())
+                            # Filter common words
+                            stop_words = {'the', 'and', 'for', 'you', 'that', 'with', 'this', 'from', 'have', 'are', 'not', 'but', 'was', 'all', 'what', 'when', 'who', 'how', 'why', 'where', 'which', 'there', 'their', 'they', 'about', 'would', 'could', 'should', 'will', 'just', 'like', 'been', 'has', 'had', 'were', 'your', 'some', 'then', 'than', 'them'}
+                            words = [w for w in words if w not in stop_words]
+                            all_words.extend(words)
+                except:
+                    pass
+        
+        if not all_words:
+            await status_msg.edit("❌ No words found!")
+            return
+        
+        # Count words
+        word_counts = Counter(all_words)
+        top_words = word_counts.most_common(limit)
+        
+        response = f"**📊 Top {limit} Most Used Words (Global)**\n\n"
+        response += "╭━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        
+        for i, (word, count) in enumerate(top_words, 1):
+            response += f"┃  {i:2}. **{word}** - {count} times\n"
+        
+        response += "╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+        response += f"📁 **Messages Analyzed:** {total_messages}\n"
+        response += f"📝 **Total Words:** {len(all_words)}"
+        
+        await status_msg.edit(response)
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {str(e)[:100]}")
+
+@client.on(events.NewMessage(pattern=r"\.usercount$"))
+@owner_only
+async def usercount_cmd(event):
+    """Show total users across all groups"""
+    status_msg = await client.send_message(event.chat_id, "🔄 Counting users across all groups...")
+    
+    try:
+        total_users = 0
+        group_stats = []
+        
+        async for dialog in client.iter_dialogs():
+            if dialog.is_group or dialog.is_channel:
+                try:
+                    # Get full channel info
+                    full_chat = await client(GetFullChannelRequest(dialog.id))
+                    member_count = full_chat.full_chat.participants_count or 0
+                    
+                    group_stats.append({
+                        'name': dialog.name,
+                        'members': member_count
+                    })
+                    
+                    total_users += member_count
+                except:
+                    pass
+        
+        # Sort by member count
+        group_stats.sort(key=lambda x: x['members'], reverse=True)
+        
+        response = f"**👥 User Count Statistics**\n\n"
+        response += f"**Total Users Across All Groups:** {total_users}\n"
+        response += f"**Total Groups:** {len(group_stats)}\n\n"
+        
+        response += "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        response += "┃  **📊 Groups by Member Count**\n"
+        
+        for i, stat in enumerate(group_stats[:10], 1):
+            name = stat['name'][:25] + "..." if len(stat['name']) > 25 else stat['name']
+            response += f"┃  {i:2}. **{name}** - {stat['members']} members\n"
+        
+        if len(group_stats) > 10:
+            response += f"┃  ... and {len(group_stats) - 10} more groups\n"
+        
+        response += "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+        
+        await status_msg.edit(response)
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {str(e)[:100]}")
+
+@client.on(events.NewMessage(pattern=r"\.activity(?:\s+(\d+))?"))
+@owner_only
+async def activity_cmd(event):
+    """Show activity graph for last X days"""
+    days = int(event.pattern_match.group(1)) if event.pattern_match and event.pattern_match.group(1) else 7
+    days = min(days, 30)  # Max 30 days
+    
+    if event.is_private:
+        await client.send_message(event.chat_id, "❌ Use this command in a group!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, f"🔄 Analyzing activity for last {days} days...")
+    
+    try:
+        # Initialize counters
+        daily_counts = defaultdict(int)
+        daily_users = defaultdict(set)
+        hourly_activity = defaultdict(int)
+        
+        # Get messages from last X days
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        async for msg in client.iter_messages(event.chat_id, limit=2000):
+            if msg.date.replace(tzinfo=None) < cutoff_date:
+                break
+            
+            if msg.sender_id and not msg.sender_id == 777000:
+                date_key = msg.date.strftime('%Y-%m-%d')
+                hour_key = msg.date.strftime('%H:00')
+                
+                daily_counts[date_key] += 1
+                daily_users[date_key].add(msg.sender_id)
+                hourly_activity[hour_key] += 1
+        
+        if not daily_counts:
+            await status_msg.edit("❌ No activity found!")
+            return
+        
+        # Build response
+        response = f"**📊 Activity Report (Last {days} Days)**\n\n"
+        
+        # Daily activity
+        response += "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        response += "┃  **📅 Daily Activity**\n"
+        
+        max_count = max(daily_counts.values())
+        
+        for date in sorted(daily_counts.keys(), reverse=True)[:days]:
+            count = daily_counts[date]
+            users = len(daily_users[date])
+            
+            # Create bar graph
+            bar_length = int((count / max_count) * 15)
+            bar = "█" * bar_length + "░" * (15 - bar_length)
+            
+            date_display = datetime.strptime(date, '%Y-%m-%d').strftime('%d %b')
+            response += f"┃  {date_display}: {bar} {count} msgs ({users} users)\n"
+        
+        response += "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+        
+        # Hourly activity
+        response += "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        response += "┃  **🕐 Peak Hours**\n"
+        
+        peak_hours = sorted(hourly_activity.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        for hour, count in peak_hours:
+            response += f"┃  {hour} - {count} messages\n"
+        
+        response += "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+        
+        # Summary
+        total_messages = sum(daily_counts.values())
+        total_users = len(set.union(*daily_users.values())) if daily_users else 0
+        avg_daily = total_messages / len(daily_counts)
+        
+        response += f"**📈 Summary:**\n"
+        response += f"• Total Messages: {total_messages}\n"
+        response += f"• Active Users: {total_users}\n"
+        response += f"• Avg Daily Messages: {avg_daily:.1f}"
+        
+        await status_msg.edit(response)
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {str(e)[:100]}")
+
+@client.on(events.NewMessage(pattern=r"\.firstmessage$"))
+@owner_only
+async def firstmessage_cmd(event):
+    """Find first message in current chat"""
+    if event.is_private:
+        await client.send_message(event.chat_id, "❌ Use this command in a group!")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, "🔄 Finding first message...")
+    
+    try:
+        # Get all messages from beginning
+        first_msg = None
+        async for msg in client.iter_messages(event.chat_id, reverse=True, limit=1):
+            first_msg = msg
+            break
+        
+        if not first_msg:
+            await status_msg.edit("❌ Could not find first message!")
+            return
+        
+        # Get sender info
+        sender = await first_msg.get_sender()
+        sender_name = sender.first_name if sender else "Unknown"
+        
+        # Calculate age
+        message_date = first_msg.date.replace(tzinfo=None)
+        now = datetime.now()
+        delta = now - message_date
+        
+        years = delta.days // 365
+        months = (delta.days % 365) // 30
+        days = (delta.days % 365) % 30
+        
+        age_str = []
+        if years > 0:
+            age_str.append(f"{years} year{'s' if years > 1 else ''}")
+        if months > 0:
+            age_str.append(f"{months} month{'s' if months > 1 else ''}")
+        if days > 0:
+            age_str.append(f"{days} day{'s' if days > 1 else ''}")
+        
+        age_display = ", ".join(age_str) if age_str else "Today"
+        
+        response = f"""**📜 First Message in This Chat**
+
+╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮
+┃  **👤 Sender:** {sender_name}
+┃  **📅 Date:** {message_date.strftime('%d %B %Y, %H:%M:%S')}
+┃  **⏰ Age:** {age_display} ago
+┃  **🔗 Message Link:** https://t.me/c/{str(event.chat_id)[4:]}/{first_msg.id}
+╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯
+
+**💬 Message:**
+{first_msg.text[:500] if first_msg.text else '[Media/Non-text message]'}"""
+        
+        await status_msg.edit(response)
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {str(e)[:100]}")
+
+@client.on(events.NewMessage(pattern=r"\.lastseen(?:\s+@?(\w+))?"))
+@owner_only
+async def lastseen_cmd(event):
+    """Check when a user was last online"""
+    
+    # Get user from reply or username
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        user = await reply_msg.get_sender()
+    elif event.pattern_match and event.pattern_match.group(1):
+        username = event.pattern_match.group(1).strip()
+        try:
+            user = await client.get_entity(username)
+        except:
+            await client.send_message(event.chat_id, f"❌ User **@{username}** not found!")
+            return
+    else:
+        await client.send_message(event.chat_id, "❌ Reply to a user or provide username!\nUsage: `.lastseen @username`")
+        return
+    
+    status_msg = await client.send_message(event.chat_id, f"🔄 Checking **{user.first_name}**...")
+    
+    try:
+        # Get full user info
+        full_user = await client(GetFullUserRequest(user.id))
+        
+        name = user.first_name or "Unknown"
+        if user.last_name:
+            name += f" {user.last_name}"
+        
+        response = f"**👤 Last Seen: {name}**\n\n"
+        response += "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        
+        # User ID
+        response += f"┃  **🆔 User ID:** `{user.id}`\n"
+        
+        # Username
+        if user.username:
+            response += f"┃  **📛 Username:** @{user.username}\n"
+        
+        # Status
+        if hasattr(user.status, 'was_online'):
+            last_online = user.status.was_online.replace(tzinfo=None)
+            now = datetime.now()
+            delta = now - last_online
+            
+            if delta.days > 0:
+                time_ago = f"{delta.days} day{'s' if delta.days > 1 else ''} ago"
+            elif delta.seconds > 3600:
+                hours = delta.seconds // 3600
+                time_ago = f"{hours} hour{'s' if hours > 1 else ''} ago"
+            elif delta.seconds > 60:
+                minutes = delta.seconds // 60
+                time_ago = f"{minutes} minute{'s' if minutes > 1 else ''} ago"
+            else:
+                time_ago = "Just now"
+            
+            response += f"┃  **🟢 Last Online:** {time_ago}\n"
+            response += f"┃  **📅 Exact Time:** {last_online.strftime('%d %b %Y, %H:%M:%S')}\n"
+            
+        elif hasattr(user.status, 'expires'):
+            response += f"┃  **🟡 Status:** Online (Premium - Hidden)\n"
+        elif str(user.status) == 'UserStatusOnline()':
+            response += f"┃  **🟢 Status:** **ONLINE NOW**\n"
+        elif str(user.status) == 'UserStatusRecently()':
+            response += f"┃  **🟡 Status:** Recently (Last week)\n"
+        elif str(user.status) == 'UserStatusLastWeek()':
+            response += f"┃  **🔴 Status:** Last week\n"
+        elif str(user.status) == 'UserStatusLastMonth()':
+            response += f"┃  **⚫ Status:** Last month\n"
+        elif str(user.status) == 'UserStatusOffline()':
+            response += f"┃  **⚪ Status:** Offline (Long time ago)\n"
+        else:
+            response += f"┃  **❓ Status:** Hidden/Unknown\n"
+        
+        # Bot?
+        if user.bot:
+            response += f"┃  **🤖 Type:** Bot\n"
+        
+        # Premium?
+        if getattr(user, 'premium', False):
+            response += f"┃  **⭐ Account:** Premium\n"
+        
+        # Scam/Verified
+        if getattr(user, 'scam', False):
+            response += f"┃  **⚠️ Warning:** Scam account!\n"
+        if getattr(user, 'verified', False):
+            response += f"┃  **✅ Account:** Verified\n"
+        
+        # About/Bio
+        if full_user.full_user.about:
+            about = full_user.full_user.about[:100]
+            response += f"┃  **📝 Bio:** {about}\n"
+        
+        # Common chats
+        common = full_user.full_user.common_chats_count or 0
+        response += f"┃  **💬 Common Groups:** {common}\n"
+        
+        response += "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+        
+        await status_msg.edit(response)
+        
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {str(e)[:100]}")
+        
+@client.on(events.NewMessage(pattern=r"\.define(?:\s+(.+))?"))
+@owner_only
+async def define_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        word = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        word = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not word:
+        await event.reply("Usage: .define <word> or reply to a message")
+        return
+    
+    definition = await get_words_definition(word)
+    await event.reply(f"**📖 {word}**\n\n{definition}")
+
+@client.on(events.NewMessage(pattern=r"\.ud(?:\s+(.+))?"))
+@owner_only
+async def urban_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        word = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        word = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not word:
+        await event.reply("Usage: .ud <word> or reply to a message")
+        return
+    
+    definition = await get_urban_definition(word)
+    await event.reply(definition)
+
+@client.on(events.NewMessage(pattern=r"\.eval (.+)"))
+@owner_only
+async def eval_cmd(event):
+    code = event.pattern_match.group(1)
+    try:
+        result = eval(code)
+        await event.reply(f"```\n{result}\n```")
+    except Exception as e:
+        await event.reply(f"```\nError: {e}\n```")
+
+@client.on(events.NewMessage(pattern=r"\.exec (.+)"))
+@owner_only
+async def exec_cmd(event):
+    command = event.pattern_match.group(1)
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+        output = result.stdout + result.stderr
+        if len(output) > 4000:
+            output = output[:4000] + "\n... (truncated)"
+        if output:
+            await event.reply(f"```\n{output}\n```")
+        else:
+            await event.reply("```\nCommand executed successfully (no output)\n```")
+    except Exception as e:
+        await event.reply(f"```\nError: {e}\n```")
+
+@client.on(events.NewMessage(pattern=r"\.truth$"))
+@owner_only
+async def truth_cmd(event):
+    await event.reply(f"**🔮 Truth:**\n{random.choice(TRUTHS)}")
+
+@client.on(events.NewMessage(pattern=r"\.dare$"))
+@owner_only
+async def dare_cmd(event):
+    await event.reply(f"**🔥 Dare:**\n{random.choice(DARES)}")
+
+@client.on(events.NewMessage(pattern=r"\.shayari$"))
+@owner_only
+async def shayari_cmd(event):
+    await event.reply(f"**📜 Shayari:**\n\n{random.choice(SHAYARIS)}")
+
+@client.on(events.NewMessage(pattern=r"\.uwu(?:\s+(.+))?"))
+@owner_only
+async def uwu_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .uwu <text> or reply to a message")
+        return
+    
+    uwu_text = uwuify(text)
+    await event.reply(uwu_text)
+
+@client.on(events.NewMessage(pattern=r"\.mock(?:\s+(.+))?"))
+@owner_only
+async def mock_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .mock <text> or reply to a message")
+        return
+    
+    mocked = mock_text(text)
+    await event.reply(mocked)
+
+@client.on(events.NewMessage(pattern=r"\.mockt(?:\s+(.+))?"))
+@owner_only
+async def mockt_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .mockt <text> or reply to a message")
+        return
+    
+    mocked = mock_text(text)
+    await event.reply(mocked)
+
+@client.on(events.NewMessage(pattern=r"\.reverse(?:\s+(.+))?"))
+@owner_only
+async def reverse_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .reverse <text> or reply to a message")
+        return
+    
+    reversed_text = text[::-1]
+    await event.reply(reversed_text)
+
+@client.on(events.NewMessage(pattern=r"\.vapor(?:\s+(.+))?"))
+@owner_only
+async def vapor_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .vapor <text> or reply to a message")
+        return
+    
+    vapor_text = vaporwave(text)
+    await event.reply(vapor_text)
+
+@client.on(events.NewMessage(pattern=r"\.weebify(?:\s+(.+))?"))
+@owner_only
+async def weebify_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .weebify <text> or reply to a message")
+        return
+    
+    weeb_text = weebify(text)
+    await event.reply(weeb_text)
+
+@client.on(events.NewMessage(pattern=r"\.flip(?:\s+(.+))?"))
+@owner_only
+async def flip_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .flip <text> or reply to a message")
+        return
+    
+    flipped = flip_text(text)
+    await event.reply(flipped)
+
+@client.on(events.NewMessage(pattern=r"\.lorem(?:\s+(\d+))?$"))
+@owner_only
+async def lorem_cmd(event):
+    count = int(event.pattern_match.group(1)) if event.pattern_match.group(1) else 1
+    count = min(count, 10)  # Limit to 10 paragraphs
+    lorem_text = generate_lorem(count)
+    await event.reply(lorem_text)
+
+@client.on(events.NewMessage(pattern=r"\.paste(?:\s+(.+))?"))
+@owner_only
+async def paste_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        text = reply_msg.text or reply_msg.raw_text or ""
+    else:
+        text = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not text:
+        await event.reply("Usage: .paste <text> or reply to a message")
+        return
+    
+    url = await paste_to_nekobin(text)
+    await event.reply(f"📋 **Pasted to Nekobin:**\n{url}")
+
+@client.on(events.NewMessage(pattern=r"\.lyrics(?:\s+(.+))?"))
+@owner_only
+async def lyrics_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        query = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        query = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not query:
+        await event.reply("Usage: .lyrics <song name> or reply to a message")
+        return
+    
+    await event.reply("🔍 Searching lyrics...")
+    lyrics = await search_lyrics(query)
+    await event.reply(lyrics)
+
+@client.on(events.NewMessage(pattern=r"\.l(?:\s+(.+))?"))
+@owner_only
+async def l_alias_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        query = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        query = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not query:
+        await event.reply("Usage: .l <song name> or reply to a message")
+        return
+    
+    await event.reply("🔍 Searching lyrics...")
+    lyrics = await search_lyrics(query)
+    await event.reply(lyrics)
+
+@client.on(events.NewMessage(pattern=r"\.wordcount$"))
+@owner_only
+async def wordcount_cmd(event):
+    """Count most used words in last 1000 messages"""
+    status_msg = await event.reply("🔍 Analyzing last 1000 messages...")
+    messages = []
+    async for msg in client.iter_messages(event.chat_id, limit=1000):
+        if msg.text:
+            messages.append(msg.text.lower())
+    
+    words = []
+    for msg in messages:
+        words.extend(re.findall(r'\b[a-z]{3,}\b', msg))
+    
+    word_counts = Counter(words).most_common(25)
+    
+    result = "**📊 Top 25 Most Used Words:**\n\n"
+    for i, (word, count) in enumerate(word_counts, 1):
+        result += f"{i}. **{word}** - {count} times\n"
+    
+    await status_msg.edit(result)
+
+@client.on(events.NewMessage(pattern=r"\.oof$"))
+@owner_only
+async def oof_cmd(event):
+    oof_frames = [
+        "O",
+        "Oo",
+        "Oof",
+        "Oooof",
+        "Ooooof",
+        "Oooooof",
+        "Ooooooof",
+        "Oooooooof",
+        "Ooooooooof",
+        "Oooooooooof",
+        "Ooooooooooof",
+        "**💥 OOOOOOOOOOF 💥**"
+    ]
+    
+    msg = await event.reply("O")
+    for frame in oof_frames[1:]:
+        await asyncio.sleep(0.3)
+        await msg.edit(frame)
+
+@client.on(events.NewMessage(pattern=r"\.gif(?:\s+(.+))?"))
+@owner_only
+async def gif_cmd(event):
+    if event.reply_to_msg_id:
+        reply_msg = await event.get_reply_message()
+        query = reply_msg.text.strip() if reply_msg.text else ""
+    else:
+        query = event.pattern_match.group(1) if event.pattern_match else ""
+    
+    if not query:
+        await event.reply("Usage: .gif <query> or reply to a message")
+        return
+    
+    status_msg = await event.reply(f"🔍 Searching GIF: {query}")
+    
+    try:
+        search_url = f"https://g.tenor.com/v1/search?q={urllib.parse.quote(query)}&key=LIVDSRZULELA&limit=5"
+        response = requests.get(search_url)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data["results"]:
+                gif_url = data["results"][0]["media"][0]["gif"]["url"]
+                await status_msg.delete()
+                await event.reply(file=gif_url)
+            else:
+                await status_msg.edit("❌ No GIFs found.")
+        else:
+            await status_msg.edit("❌ Error searching GIFs.")
+    except Exception as e:
+        await status_msg.edit(f"❌ Error: {e}")
+
+@client.on(events.NewMessage(pattern=r"\.quote|\.q(?: (\w+))?"))
+@owner_only
+async def quote_cmd(event):
+    """Create a quote from replied message"""
+    if not event.reply_to_msg_id:
+        await event.reply("❌ Reply to a message to quote it!")
+        return
+    
+    color = event.pattern_match.group(1) if event.pattern_match and event.pattern_match.group(1) else "white"
+    
+    try:
+        reply_msg = await event.get_reply_message()
+        sender = await reply_msg.get_sender()
+        text = reply_msg.text or reply_msg.raw_text or "Media message"
+        
+        # Truncate long text
+        if len(text) > 500:
+            text = text[:500] + "..."
+        
+        # Create quote format
+        quote_text = f"「{text}」\n\n— {sender.first_name if sender else 'Unknown'}"
+        
+        # Color mapping
+        colors = {
+            "white": "⬜",
+            "black": "⬛",
+            "red": "🟥",
+            "blue": "🟦",
+            "green": "🟩",
+            "yellow": "🟨",
+            "purple": "🟪",
+            "orange": "🟧",
+            "brown": "🟫",
+        }
+        
+        color_emoji = colors.get(color.lower(), "⬜")
+        
+        # Send as formatted quote
+        await event.reply(f"{color_emoji} **Quote:**\n\n{quote_text}")
+        
+    except Exception as e:
+        await event.reply(f"❌ Error creating quote: {e}")
 
 @client.on(events.NewMessage(pattern=r'\.extract'))
 async def extract_handler(event):
@@ -2857,7 +4881,9 @@ async def simple_info(event):
         await event.reply(info_text)
         
     except Exception as e:
-        await event.reply(f"❌ Error: {str(e)}")
+        await event.reply(f"❌ Error: {str(e)}") 
+        
+
 
 from telethon import events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
@@ -14837,24 +16863,31 @@ middle_finger_lines = [
 ]
 
 # Global trackers
-ongoing_tasks = {}
-reply_raid_targets = {}
-flirt_raid_targets = {}
-love_raid_targets = {}
-quote_raid_targets = {}
-mass_love_raid_targets = {}
-shayari_raid_targets = {}
-raid_shayari_targets = {}
-roast_boy_raid_targets = {}
-roast_girl_raid_targets = {}
-roast_abuse_raid_targets = {}
-flirt_girl_raid_targets = {}
-hindi_roast_boy_raid_targets = {}
-hindi_roast_girl_raid_targets = {}
-hindi_roast_abuse_raid_targets = {}
-hindi_flirt_girl_raid_targets = {}
-raid100_targets = {}
-raid_targets = {}
+from collections import defaultdict
+
+def session_dict():
+    """Har session ke liye alag dictionary"""
+    return defaultdict(dict)
+
+# Har tracker ab {client_id: {chat_id: value}} format mein hoga
+ongoing_tasks = defaultdict(dict)
+reply_raid_targets = defaultdict(dict)
+flirt_raid_targets = defaultdict(dict)
+love_raid_targets = defaultdict(dict)
+quote_raid_targets = defaultdict(dict)
+mass_love_raid_targets = defaultdict(dict)
+shayari_raid_targets = defaultdict(dict)
+raid_shayari_targets = defaultdict(dict)
+roast_boy_raid_targets = defaultdict(dict)
+roast_girl_raid_targets = defaultdict(dict)
+roast_abuse_raid_targets = defaultdict(dict)
+flirt_girl_raid_targets = defaultdict(dict)
+hindi_roast_boy_raid_targets = defaultdict(dict)
+hindi_roast_girl_raid_targets = defaultdict(dict)
+hindi_roast_abuse_raid_targets = defaultdict(dict)
+hindi_flirt_girl_raid_targets = defaultdict(dict)
+raid100_targets = defaultdict(dict)
+raid_targets = defaultdict(dict)
 user_clones = {}
 original_profile = {}
 user_status = "online"
@@ -14950,15 +16983,31 @@ async def restore_original_profile():
         user_clones.pop(OWNER_ID, None); original_profile.pop(OWNER_ID, None); return True
     except Exception as e: print(f"Restore error: {e}"); return False
 
-async def send_loop(chat_id, msgs, event):
+async def send_loop(chat_id, msgs, event, sender_client=None):
+    if sender_client is None:
+        sender_client = event.client
+    
+    cid = id(sender_client)
+    
     try:
         for msg in msgs:
-            if chat_id not in ongoing_tasks: break
-            await client.send_message(chat_id, msg)
+            # Check if task still exists for this client and chat
+            if cid not in ongoing_tasks or chat_id not in ongoing_tasks[cid]:
+                break
+            
+            await sender_client.send_message(chat_id, msg)
             await asyncio.sleep(DELAY_SECONDS)  # 🔥 6 SECONDS DELAY
-    except asyncio.CancelledError: pass
-    except Exception as e: print(f"Send loop error: {e}")
-    finally: ongoing_tasks.pop(chat_id, None)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"Send loop error for client {cid}: {e}")
+    finally:
+        # Clean up task for this client and chat
+        if cid in ongoing_tasks:
+            ongoing_tasks[cid].pop(chat_id, None)
+            # Optional: clean up empty client dict
+            if not ongoing_tasks[cid]:
+                ongoing_tasks.pop(cid, None)
 
 @client.on(events.NewMessage(func=lambda e: e.is_private and e.sender_id != OWNER_ID))
 async def handle_private_message(event):
@@ -15079,6 +17128,8 @@ async def hack_animation_handler(event):
         await hack_msg.edit(f"❌ **HACKING FAILED:** {str(e)}")
         ongoing_tasks.pop(event.chat_id, None)
 
+# ==================== MIDDLE FINGER HANDLER ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(middlefinger|mf)\b"))
 async def middlefinger_animation_handler(event):
     if not is_owner(event): return
@@ -15090,8 +17141,14 @@ async def middlefinger_animation_handler(event):
     # Start middle finger animation
     mf_msg = await event.reply(f"🖕 **PREPARING MIDDLE FINGER ATTACK...**\n\n👤 Target: {mention if mention else 'EVERYONE'}\n⏰ Duration: 120 seconds")
     
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
     try:
-        ongoing_tasks[event.chat_id] = asyncio.current_task()
+        ongoing_tasks[cid][event.chat_id] = asyncio.current_task()
         # Animation phases
         phases = [
             "🖕 **Charging middle finger energy...**",
@@ -15107,7 +17164,7 @@ async def middlefinger_animation_handler(event):
         ]
         
         for i, phase in enumerate(phases):
-            if event.chat_id not in ongoing_tasks:  # Check if stopped
+            if cid not in ongoing_tasks or event.chat_id not in ongoing_tasks.get(cid, {}):
                 break
             
             # Send random middle finger message
@@ -15120,21 +17177,25 @@ async def middlefinger_animation_handler(event):
             # Update status
             progress = f"🖕 **MIDDLE FINGER ATTACK IN PROGRESS**\n\n👤 Target: {mention if mention else 'EVERYONE'}\n📊 Phase: {i+1}/{len(phases)}\n⏰ Time elapsed: {i*12} seconds\n\n{phase}"
             await mf_msg.edit(progress)
-            await asyncio.sleep(12)  # Each phase takes 12 seconds
+            await asyncio.sleep(12)
         
-        if event.chat_id in ongoing_tasks:
+        if cid in ongoing_tasks and event.chat_id in ongoing_tasks.get(cid, {}):
             final_msg = f"🖕 **MIDDLE FINGER ATTACK COMPLETE!** 🖕\n\n👤 Target: {mention if mention else 'EVERYONE'}\n⏰ Duration: 120 seconds\n💀 Status: TOTALLY OWNED!\n\n**FUCK YOU!** 🖕"
             await mf_msg.edit(final_msg)
-            ongoing_tasks.pop(event.chat_id, None)
+            ongoing_tasks[cid].pop(event.chat_id, None)
             
     except asyncio.CancelledError:
         await mf_msg.edit("❌ **MIDDLE FINGER ATTACK CANCELLED**")
-        ongoing_tasks.pop(event.chat_id, None)
+        if cid in ongoing_tasks:
+            ongoing_tasks[cid].pop(event.chat_id, None)
     except Exception as e:
         await mf_msg.edit(f"❌ **ATTACK FAILED:** {str(e)}")
-        ongoing_tasks.pop(event.chat_id, None)
+        if cid in ongoing_tasks:
+            ongoing_tasks[cid].pop(event.chat_id, None)
 
-# 📢 BROADCAST COMMANDS
+
+# ==================== BROADCAST COMMANDS ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(broadcast_dm|bdm)\b"))
 async def broadcast_dm_handler(event):
     if not is_owner(event): return
@@ -15143,7 +17204,8 @@ async def broadcast_dm_handler(event):
     if len(parts) < 2: return
     message = parts[1]
     confirm = await event.reply(f"📢 **Broadcast to ALL DMs:**\n\n{message}\n\nSend `.confirm_broadcast_dm` to send to all DMs.")
-    ongoing_tasks['broadcast_dm_msg'] = message; await delete_after_delay(confirm, 10)
+    ongoing_tasks['broadcast_dm_msg'] = message
+    await delete_after_delay(confirm, 10)
 
 @client.on(events.NewMessage(pattern=r"^\.(broadcast_group|bgrp)\b"))
 async def broadcast_group_handler(event):
@@ -15153,7 +17215,8 @@ async def broadcast_group_handler(event):
     if len(parts) < 2: return
     message = parts[1]
     confirm = await event.reply(f"📢 **Broadcast to ALL Groups:**\n\n{message}\n\nSend `.confirm_broadcast_group` to send to all groups.")
-    ongoing_tasks['broadcast_group_msg'] = message; await delete_after_delay(confirm, 10)
+    ongoing_tasks['broadcast_group_msg'] = message
+    await delete_after_delay(confirm, 10)
 
 @client.on(events.NewMessage(pattern=r"^\.(broadcast_channel|bchn)\b"))
 async def broadcast_channel_handler(event):
@@ -15163,7 +17226,8 @@ async def broadcast_channel_handler(event):
     if len(parts) < 2: return
     message = parts[1]
     confirm = await event.reply(f"📢 **Broadcast to ALL Channels:**\n\n{message}\n\nSend `.confirm_broadcast_channel` to send to all channels.")
-    ongoing_tasks['broadcast_channel_msg'] = message; await delete_after_delay(confirm, 10)
+    ongoing_tasks['broadcast_channel_msg'] = message
+    await delete_after_delay(confirm, 10)
 
 @client.on(events.NewMessage(pattern=r"^\.(broadcast_all|ball)\b"))
 async def broadcast_all_handler(event):
@@ -15173,7 +17237,8 @@ async def broadcast_all_handler(event):
     if len(parts) < 2: return
     message = parts[1]
     confirm = await event.reply(f"📢 **Broadcast to EVERYWHERE:**\n\n{message}\n\nSend `.confirm_broadcast_all` to send to DMs + Groups + Channels.")
-    ongoing_tasks['broadcast_all_msg'] = message; await delete_after_delay(confirm, 10)
+    ongoing_tasks['broadcast_all_msg'] = message
+    await delete_after_delay(confirm, 10)
 
 @client.on(events.NewMessage(pattern=r"^\.(broadcast_current|bcur)\b"))
 async def broadcast_current_handler(event):
@@ -15184,74 +17249,117 @@ async def broadcast_current_handler(event):
     message = parts[1]
     await event.reply(f"📢 **Broadcast in this chat:**\n\n{message}")
 
-# BROADCAST CONFIRMATION HANDLERS
+
+# ==================== BROADCAST CONFIRMATION HANDLERS ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(confirm_broadcast_dm|cbdm)$"))
 async def confirm_broadcast_dm_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if 'broadcast_dm_msg' not in ongoing_tasks:
-        msg = await event.reply("❌ No broadcast message set"); await delete_after_delay(msg); return
-    message = ongoing_tasks['broadcast_dm_msg']; progress = await event.reply("📤 Broadcasting to all DMs...")
-    sent = 0; failed = 0
+        msg = await event.reply("❌ No broadcast message set")
+        await delete_after_delay(msg)
+        return
+    message = ongoing_tasks['broadcast_dm_msg']
+    progress = await event.reply("📤 Broadcasting to all DMs...")
+    sent = 0
+    failed = 0
     async for dialog in client.iter_dialogs():
         if dialog.is_user and not dialog.entity.bot and dialog.entity.id != OWNER_ID:
-            try: await client.send_message(dialog.entity.id, message); sent += 1; await asyncio.sleep(1)
-            except: failed += 1
+            try:
+                await client.send_message(dialog.entity.id, message)
+                sent += 1
+                await asyncio.sleep(1)
+            except:
+                failed += 1
     await progress.edit(f"✅ DM Broadcast complete!\n✓ Sent: {sent}\n✗ Failed: {failed}")
-    ongoing_tasks.pop('broadcast_dm_msg', None); await delete_after_delay(progress, 5)
+    ongoing_tasks.pop('broadcast_dm_msg', None)
+    await delete_after_delay(progress, 5)
 
 @client.on(events.NewMessage(pattern=r"^\.(confirm_broadcast_group|cbgrp)$"))
 async def confirm_broadcast_group_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if 'broadcast_group_msg' not in ongoing_tasks:
-        msg = await event.reply("❌ No broadcast message set"); await delete_after_delay(msg); return
-    message = ongoing_tasks['broadcast_group_msg']; progress = await event.reply("📤 Broadcasting to all groups...")
-    sent = 0; failed = 0
+        msg = await event.reply("❌ No broadcast message set")
+        await delete_after_delay(msg)
+        return
+    message = ongoing_tasks['broadcast_group_msg']
+    progress = await event.reply("📤 Broadcasting to all groups...")
+    sent = 0
+    failed = 0
     async for dialog in client.iter_dialogs():
         if dialog.is_group and not dialog.entity.megagroup:
-            try: await client.send_message(dialog.entity.id, message); sent += 1; await asyncio.sleep(1)
-            except: failed += 1
+            try:
+                await client.send_message(dialog.entity.id, message)
+                sent += 1
+                await asyncio.sleep(1)
+            except:
+                failed += 1
     await progress.edit(f"✅ Group Broadcast complete!\n✓ Sent: {sent}\n✗ Failed: {failed}")
-    ongoing_tasks.pop('broadcast_group_msg', None); await delete_after_delay(progress, 5)
+    ongoing_tasks.pop('broadcast_group_msg', None)
+    await delete_after_delay(progress, 5)
 
 @client.on(events.NewMessage(pattern=r"^\.(confirm_broadcast_channel|cbchn)$"))
 async def confirm_broadcast_channel_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if 'broadcast_channel_msg' not in ongoing_tasks:
-        msg = await event.reply("❌ No broadcast message set"); await delete_after_delay(msg); return
-    message = ongoing_tasks['broadcast_channel_msg']; progress = await event.reply("📤 Broadcasting to all channels...")
-    sent = 0; failed = 0
+        msg = await event.reply("❌ No broadcast message set")
+        await delete_after_delay(msg)
+        return
+    message = ongoing_tasks['broadcast_channel_msg']
+    progress = await event.reply("📤 Broadcasting to all channels...")
+    sent = 0
+    failed = 0
     async for dialog in client.iter_dialogs():
         if dialog.is_channel and not dialog.is_group:
-            try: await client.send_message(dialog.entity.id, message); sent += 1; await asyncio.sleep(1)
-            except: failed += 1
+            try:
+                await client.send_message(dialog.entity.id, message)
+                sent += 1
+                await asyncio.sleep(1)
+            except:
+                failed += 1
     await progress.edit(f"✅ Channel Broadcast complete!\n✓ Sent: {sent}\n✗ Failed: {failed}")
-    ongoing_tasks.pop('broadcast_channel_msg', None); await delete_after_delay(progress, 5)
+    ongoing_tasks.pop('broadcast_channel_msg', None)
+    await delete_after_delay(progress, 5)
 
 @client.on(events.NewMessage(pattern=r"^\.(confirm_broadcast_all|cball)$"))
 async def confirm_broadcast_all_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if 'broadcast_all_msg' not in ongoing_tasks:
-        msg = await event.reply("❌ No broadcast message set"); await delete_after_delay(msg); return
-    message = ongoing_tasks['broadcast_all_msg']; progress = await event.reply("📤 Broadcasting to EVERYWHERE...")
-    sent_dm = 0; failed_dm = 0; sent_grp = 0; failed_grp = 0; sent_chn = 0; failed_chn = 0
+        msg = await event.reply("❌ No broadcast message set")
+        await delete_after_delay(msg)
+        return
+    message = ongoing_tasks['broadcast_all_msg']
+    progress = await event.reply("📤 Broadcasting to EVERYWHERE...")
+    sent_dm = 0
+    failed_dm = 0
+    sent_grp = 0
+    failed_grp = 0
+    sent_chn = 0
+    failed_chn = 0
     
     async for dialog in client.iter_dialogs():
         try:
             if dialog.is_user and not dialog.entity.bot and dialog.entity.id != OWNER_ID:
-                await client.send_message(dialog.entity.id, message); sent_dm += 1
+                await client.send_message(dialog.entity.id, message)
+                sent_dm += 1
             elif dialog.is_group and not dialog.entity.megagroup:
-                await client.send_message(dialog.entity.id, message); sent_grp += 1
+                await client.send_message(dialog.entity.id, message)
+                sent_grp += 1
             elif dialog.is_channel and not dialog.is_group:
-                await client.send_message(dialog.entity.id, message); sent_chn += 1
+                await client.send_message(dialog.entity.id, message)
+                sent_chn += 1
             await asyncio.sleep(1)
         except:
-            if dialog.is_user: failed_dm += 1
-            elif dialog.is_group: failed_grp += 1
-            elif dialog.is_channel: failed_chn += 1
+            if dialog.is_user:
+                failed_dm += 1
+            elif dialog.is_group:
+                failed_grp += 1
+            elif dialog.is_channel:
+                failed_chn += 1
     
     total_sent = sent_dm + sent_grp + sent_chn
     total_failed = failed_dm + failed_grp + failed_chn
@@ -15266,53 +17374,87 @@ async def confirm_broadcast_all_handler(event):
 📊 Total: ✓ {total_sent} | ✗ {total_failed}```
     """
     await progress.edit(result_msg)
-    ongoing_tasks.pop('broadcast_all_msg', None); await delete_after_delay(progress, 8)
+    ongoing_tasks.pop('broadcast_all_msg', None)
+    await delete_after_delay(progress, 8)
 
-# 🔥 ROAST COMMANDS - LONG + SHORT
+
+# ==================== ROAST COMMANDS (MULTI-SESSION) ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(roast_boy|rb)\b"))
 async def roast_boy_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(boys_roast)}" if mention else random.choice(boys_roast)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```🔥 Roast started! {count} messages```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```🔥 Roast started! {count} messages```")
+    await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(roast_girl|rg)\b"))
 async def roast_girl_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(girls_roast)}" if mention else random.choice(girls_roast)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```🔥 Roast started! {count} messages```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```🔥 Roast started! {count} messages```")
+    await delete_after_delay(status_msg)
 
-# Again Raid feature - Automatically reply to specific user's messages
-again_raid_users = {}  # Dictionary to store {user_id: reply_message}
+
+# ==================== AGAIN RAID FEATURE ====================
+
+again_raid_users = {}
 
 @client.on(events.NewMessage(pattern=r'\.(?:ar|again_raid)(?:\s+(.+))?', outgoing=True))
 async def start_again_raid(event):
-    """Start again raid on a user - automatically reply to their messages"""
-    
-    # Check if replying to a user
     if not event.is_reply:
         await event.delete()
         msg = await event.respond("❌ Please reply to a user to start again raid!\nUsage: .ar <message>")
@@ -15320,11 +17462,8 @@ async def start_again_raid(event):
         await msg.delete()
         return
     
-    # Get the replied message
     reply_msg = await event.get_reply_message()
     user_id = reply_msg.sender_id
-    
-    # Get the message to send as auto-reply
     raid_message = event.pattern_match.group(1)
     
     if not raid_message:
@@ -15334,13 +17473,9 @@ async def start_again_raid(event):
         await msg.delete()
         return
     
-    # Add user to again_raid dictionary
     again_raid_users[user_id] = raid_message
-    
-    # Delete the command message
     await event.delete()
     
-    # Get user info
     try:
         user = await event.client.get_entity(user_id)
         user_name = user.first_name or "User"
@@ -15349,18 +17484,12 @@ async def start_again_raid(event):
         user_name = "User"
         username = f"ID: {user_id}"
     
-    # Send confirmation message
     msg = await event.respond(f"✅ **Again Raid Started!**\n\n**User:** {user_name}\n**Username:** {username}\n**Auto-Reply:** `{raid_message}`\n\n⚠️ Har message par automatically reply hoga!\n⛔ Rokne ke liye: `.sar` ya `.stop_again_raid`")
-    
-    # Wait for 3 seconds and delete the confirmation message
     await asyncio.sleep(3)
     await msg.delete()
 
 @client.on(events.NewMessage(pattern=r'\.(?:sar|stop_again_raid)(?:\s+(.+))?$', outgoing=True))
 async def stop_again_raid(event):
-    """Stop again raid on a user"""
-    
-    # Check if "all" command
     if event.pattern_match.group(1) == "all":
         if len(again_raid_users) == 0:
             await event.delete()
@@ -15378,9 +17507,7 @@ async def stop_again_raid(event):
         await msg.delete()
         return
     
-    # Check if replying to a user
     if not event.is_reply:
-        # Show list of active raids
         if len(again_raid_users) == 0:
             await event.delete()
             msg = await event.respond("❌ Koi again raid active nahi hai!")
@@ -15389,7 +17516,6 @@ async def stop_again_raid(event):
             return
         
         await event.delete()
-        
         text = "**⚠️ Active Again Raids:**\n\n"
         for uid, msg_text in again_raid_users.items():
             try:
@@ -15408,18 +17534,12 @@ async def stop_again_raid(event):
         await msg.delete()
         return
     
-    # Get the replied message
     reply_msg = await event.get_reply_message()
     user_id = reply_msg.sender_id
-    
-    # Delete the command message
     await event.delete()
     
     if user_id in again_raid_users:
-        # Remove user from again_raid dictionary
         del again_raid_users[user_id]
-        
-        # Get user info
         try:
             user = await event.client.get_entity(user_id)
             user_name = user.first_name or "User"
@@ -15436,157 +17556,269 @@ async def stop_again_raid(event):
 
 @client.on(events.NewMessage(incoming=True))
 async def again_raid_handler(event):
-    """Handle incoming messages and reply if user is in again_raid"""
-    
-    # Ignore if message is from self
     if event.message.out:
         return
     
-    # Get my user ID
     me = await event.client.get_me()
     
-    # Ignore if sender is myself
     if event.sender_id == me.id:
         return
     
-    # Check if sender is in again_raid dictionary
     if event.sender_id in again_raid_users:
         raid_message = again_raid_users[event.sender_id]
-        
-        # Small delay to avoid flood
         await asyncio.sleep(0.1)
-        
-        # Reply to the message
         try:
             await event.reply(raid_message)
         except Exception as e:
-            # If can't reply, remove from again_raid
             logger.error(f"Error in again_raid reply: {e}")
             if event.sender_id in again_raid_users:
                 del again_raid_users[event.sender_id]
-                
+
+
+# ==================== ROAST ABUSE HANDLER (MULTI-SESSION) ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(roast_abuse|ra)\b"))
 async def roast_abuse_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
+    
+    if not abuse_roast:
+        await event.reply("```❌ Abuse roast list is empty!```")
+        return
+    
     msgs = [(f"{mention} {random.choice(abuse_roast)}" if mention else random.choice(abuse_roast)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```🔥 Abuse roast started! {count} messages```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    
+    status_msg = await event.reply(f"```🔥 Abuse roast started! {count} messages```")
+    await delete_after_delay(status_msg)
+
+
+# ==================== FLIRT COMMANDS (MULTI-SESSION) ====================
 
 @client.on(events.NewMessage(pattern=r"^\.(flirt_girl|fg)\b"))
 async def flirt_girl_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(flirt_lines)}" if mention else random.choice(flirt_lines)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```💖 Flirt started! {count} messages```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```💖 Flirt started! {count} messages```")
+    await delete_after_delay(status_msg)
 
-# 🔥 HINDI ROAST COMMANDS - LONG + SHORT
+
+# ==================== HINDI ROAST COMMANDS (MULTI-SESSION) ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(hindi_roast_boy|hrb)\b"))
 async def hindi_roast_boy_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(hindi_boys_roast)}" if mention else random.choice(hindi_boys_roast)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```🔥 लड़का रोस्ट शुरू! {count} मैसेज```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```🔥 लड़का रोस्ट शुरू! {count} मैसेज```")
+    await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(hindi_roast_girl|hrg)\b"))
 async def hindi_roast_girl_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(hindi_girls_roast)}" if mention else random.choice(hindi_girls_roast)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```🔥 लड़की रोस्ट शुरू! {count} मैसेज```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```🔥 लड़की रोस्ट शुरू! {count} मैसेज```")
+    await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(hindi_roast_abuse|hra)\b"))
 async def hindi_roast_abuse_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(hindi_abuse_roast)}" if mention else random.choice(hindi_abuse_roast)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```🔥 गाली रोस्ट शुरू! {count} मैसेज```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```🔥 गाली रोस्ट शुरू! {count} मैसेज```")
+    await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(hindi_flirt_girl|hfg)\b"))
 async def hindi_flirt_girl_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
-    parts = event.raw_text.split(); count = 1; target_user = None
+    parts = event.raw_text.split()
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(hindi_flirt_lines)}" if mention else random.choice(hindi_flirt_lines)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```💖 फ्लर्ट शुरू! {count} मैसेज```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```💖 फ्लर्ट शुरू! {count} मैसेज```")
+    await delete_after_delay(status_msg)
 
-# 💣 RAID COMMANDS - LONG + SHORT
+
+# ==================== RAID COMMANDS (MULTI-SESSION) ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(raid100|r100)\b"))
 async def raid100_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2: return
-    msg = parts[1]; msgs = [msg] * 100
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply("```💣 Raid100 started!```"); await delete_after_delay(status_msg)
+    msg = parts[1]
+    msgs = [msg] * 100
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply("```💣 Raid100 started!```")
+    await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(raid|rd)\b"))
 async def raid_handler(event):
@@ -15594,14 +17826,49 @@ async def raid_handler(event):
     await delete_command_message(event)
     parts = event.raw_text.split(maxsplit=2)
     if len(parts) < 3 or not parts[1].isdigit(): return
-    count = min(int(parts[1]), MAX_PER_RUN); msg = parts[2]; msgs = [msg] * count
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event))
-    ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```💣 Raid started! {count} messages```"); await delete_after_delay(status_msg)
+    count = min(int(parts[1]), MAX_PER_RUN)
+    msg = parts[2]
+    msgs = [msg] * count
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```💣 Raid started! {count} messages```")
+    await delete_after_delay(status_msg)
 
-# 🔁 AUTO-REPLY RAID COMMANDS - LONG + SHORT
+
+# ==================== RAID TARGETS DICTIONARIES ====================
+
+reply_raid_targets = {}
+flirt_raid_targets = {}
+love_raid_targets = {}
+quote_raid_targets = {}
+mass_love_raid_targets = {}
+shayari_raid_targets = {}
+raid_shayari_targets = {}
+roast_boy_raid_targets = {}
+roast_girl_raid_targets = {}
+roast_abuse_raid_targets = {}
+flirt_girl_raid_targets = {}
+hindi_roast_boy_raid_targets = {}
+hindi_roast_girl_raid_targets = {}
+hindi_roast_abuse_raid_targets = {}
+hindi_flirt_girl_raid_targets = {}
+raid100_targets = {}
+raid_targets = {}
+
+
+# ==================== RAID ACTIVATION HANDLERS ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(reply_raid|rr)\b"))
 async def reply_raid_handler(event):
     if not is_owner(event): return
@@ -15609,7 +17876,8 @@ async def reply_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     reply_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```🔁 Reply raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```🔁 Reply raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(flirt_raid|fr)\b"))
 async def flirt_raid_handler(event):
@@ -15618,9 +17886,9 @@ async def flirt_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     flirt_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"💖 Flirt raid activated on {target_user.first_name}!"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"💖 Flirt raid activated on {target_user.first_name}!")
+    await delete_after_delay(status_msg)
 
-# 💖 LOVE RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(love_raid|lr)\b"))
 async def love_raid_handler(event):
     if not is_owner(event): return
@@ -15628,9 +17896,9 @@ async def love_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     love_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"💖 Love raid activated on {target_user.first_name}!"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"💖 Love raid activated on {target_user.first_name}!")
+    await delete_after_delay(status_msg)
 
-# 💫 QUOTE RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(quote_raid|qr)\b"))
 async def quote_raid_handler(event):
     if not is_owner(event): return
@@ -15638,9 +17906,9 @@ async def quote_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     quote_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"💫 Quote raid activated on {target_user.first_name}!"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"💫 Quote raid activated on {target_user.first_name}!")
+    await delete_after_delay(status_msg)
 
-# 💕 MASS LOVE RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(mass_love_raid|mlr)\b"))
 async def mass_love_raid_handler(event):
     if not is_owner(event): return
@@ -15648,9 +17916,9 @@ async def mass_love_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     mass_love_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"💕 Mass love raid activated on {target_user.first_name}!"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"💕 Mass love raid activated on {target_user.first_name}!")
+    await delete_after_delay(status_msg)
 
-# 📜 SHAYARI RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(shayari_raid|sr)\b"))
 async def shayari_raid_handler(event):
     if not is_owner(event): return
@@ -15658,9 +17926,9 @@ async def shayari_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     shayari_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"📜 Shayari raid activated on {target_user.first_name}!"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"📜 Shayari raid activated on {target_user.first_name}!")
+    await delete_after_delay(status_msg)
 
-# 📜 RAID SHAYARI RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(raid_shayari_raid|rsr)\b"))
 async def raid_shayari_raid_handler(event):
     if not is_owner(event): return
@@ -15668,9 +17936,9 @@ async def raid_shayari_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     raid_shayari_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```📜 Raid shayari activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```📜 Raid shayari activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 🔥 ROAST BOY RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(roast_boy_raid|rbr)\b"))
 async def roast_boy_raid_handler(event):
     if not is_owner(event): return
@@ -15678,9 +17946,9 @@ async def roast_boy_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     roast_boy_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"🔥 Roast boy raid activated on {target_user.first_name}!"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"🔥 Roast boy raid activated on {target_user.first_name}!")
+    await delete_after_delay(status_msg)
 
-# 👧 ROAST GIRL RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(roast_girl_raid|rgr)\b"))
 async def roast_girl_raid_handler(event):
     if not is_owner(event): return
@@ -15688,9 +17956,9 @@ async def roast_girl_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     roast_girl_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```👧 Roast girl raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```👧 Roast girl raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 🗣️ ROAST ABUSE RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(roast_abuse_raid|rar)\b"))
 async def roast_abuse_raid_handler(event):
     if not is_owner(event): return
@@ -15698,9 +17966,9 @@ async def roast_abuse_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     roast_abuse_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```🗣️ Roast abuse raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```🗣️ Roast abuse raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 💖 FLIRT GIRL RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(flirt_girl_raid|fgr)\b"))
 async def flirt_girl_raid_handler(event):
     if not is_owner(event): return
@@ -15708,9 +17976,9 @@ async def flirt_girl_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     flirt_girl_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```💖 Flirt girl raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```💖 Flirt girl raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 🔥 HINDI ROAST BOY RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(hindi_roast_boy_raid|hrbr)\b"))
 async def hindi_roast_boy_raid_handler(event):
     if not is_owner(event): return
@@ -15718,9 +17986,9 @@ async def hindi_roast_boy_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     hindi_roast_boy_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"🔥 Hindi roast boy raid activated on {target_user.first_name}!"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"🔥 Hindi roast boy raid activated on {target_user.first_name}!")
+    await delete_after_delay(status_msg)
 
-# 👧 HINDI ROAST GIRL RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(hindi_roast_girl_raid|hrgr)\b"))
 async def hindi_roast_girl_raid_handler(event):
     if not is_owner(event): return
@@ -15728,9 +17996,9 @@ async def hindi_roast_girl_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     hindi_roast_girl_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```👧 Hindi roast girl raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```👧 Hindi roast girl raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 🗣️ HINDI ROAST ABUSE RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(hindi_roast_abuse_raid|hrar)\b"))
 async def hindi_roast_abuse_raid_handler(event):
     if not is_owner(event): return
@@ -15738,9 +18006,9 @@ async def hindi_roast_abuse_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     hindi_roast_abuse_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```🗣️ Hindi roast abuse raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```🗣️ Hindi roast abuse raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 💖 HINDI FLIRT GIRL RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(hindi_flirt_girl_raid|hfgr)\b"))
 async def hindi_flirt_girl_raid_handler(event):
     if not is_owner(event): return
@@ -15748,9 +18016,9 @@ async def hindi_flirt_girl_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     hindi_flirt_girl_raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```💖 Hindi flirt girl raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```💖 Hindi flirt girl raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 💣 RAID100 RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(raid100_raid|r100r)\b"))
 async def raid100_raid_handler(event):
     if not is_owner(event): return
@@ -15758,9 +18026,9 @@ async def raid100_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     raid100_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```💣 Raid100 raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```💣 Raid100 raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# 💣 RAID RAID COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(raid_raid|rdr)\b"))
 async def raid_raid_handler(event):
     if not is_owner(event): return
@@ -15768,16 +18036,21 @@ async def raid_raid_handler(event):
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user: return
     raid_targets[event.chat_id] = target_user.id
-    status_msg = await event.reply(f"```💣 Raid raid activated on {target_user.first_name}!```"); await delete_after_delay(status_msg)
+    status_msg = await event.reply(f"```💣 Raid raid activated on {target_user.first_name}!```")
+    await delete_after_delay(status_msg)
 
-# STOP RAID COMMANDS
+
+# ==================== STOP RAID HANDLERS ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(stop_reply_raid|srr)$"))
 async def stop_reply_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in reply_raid_targets:
-        reply_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Reply raid stopped")
-    else: status_msg = await event.reply("❌ No active reply raid")
+        reply_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Reply raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active reply raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_flirt_raid|sfr)$"))
@@ -15785,8 +18058,10 @@ async def stop_flirt_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in flirt_raid_targets:
-        flirt_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Flirt raid stopped")
-    else: status_msg = await event.reply("❌ No active flirt raid")
+        flirt_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Flirt raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active flirt raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_love_raid|slr)$"))
@@ -15794,8 +18069,10 @@ async def stop_love_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in love_raid_targets:
-        love_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Love raid stopped")
-    else: status_msg = await event.reply("❌ No active love raid")
+        love_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Love raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active love raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_quote_raid|sqr)$"))
@@ -15803,8 +18080,10 @@ async def stop_quote_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in quote_raid_targets:
-        quote_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Quote raid stopped")
-    else: status_msg = await event.reply("❌ No active quote raid")
+        quote_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Quote raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active quote raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_mass_love_raid|smlr)$"))
@@ -15812,8 +18091,10 @@ async def stop_mass_love_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in mass_love_raid_targets:
-        mass_love_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Mass love raid stopped")
-    else: status_msg = await event.reply("❌ No active mass love raid")
+        mass_love_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Mass love raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active mass love raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_shayari_raid|ssr)$"))
@@ -15821,8 +18102,10 @@ async def stop_shayari_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in shayari_raid_targets:
-        shayari_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Shayari raid stopped")
-    else: status_msg = await event.reply("❌ No active shayari raid")
+        shayari_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Shayari raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active shayari raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_raid_shayari_raid|srsr)$"))
@@ -15830,8 +18113,10 @@ async def stop_raid_shayari_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in raid_shayari_targets:
-        raid_shayari_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Raid shayari stopped")
-    else: status_msg = await event.reply("❌ No active raid shayari")
+        raid_shayari_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Raid shayari stopped")
+    else:
+        status_msg = await event.reply("❌ No active raid shayari")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_roast_boy_raid|srbr)$"))
@@ -15839,8 +18124,10 @@ async def stop_roast_boy_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in roast_boy_raid_targets:
-        roast_boy_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Roast boy raid stopped")
-    else: status_msg = await event.reply("❌ No active roast boy raid")
+        roast_boy_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Roast boy raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active roast boy raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_roast_girl_raid|srgr)$"))
@@ -15848,8 +18135,10 @@ async def stop_roast_girl_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in roast_girl_raid_targets:
-        roast_girl_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Roast girl raid stopped")
-    else: status_msg = await event.reply("❌ No active roast girl raid")
+        roast_girl_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Roast girl raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active roast girl raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_roast_abuse_raid|srar)$"))
@@ -15857,8 +18146,10 @@ async def stop_roast_abuse_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in roast_abuse_raid_targets:
-        roast_abuse_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Roast abuse raid stopped")
-    else: status_msg = await event.reply("❌ No active roast abuse raid")
+        roast_abuse_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Roast abuse raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active roast abuse raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_flirt_girl_raid|sfgr)$"))
@@ -15866,8 +18157,10 @@ async def stop_flirt_girl_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in flirt_girl_raid_targets:
-        flirt_girl_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Flirt girl raid stopped")
-    else: status_msg = await event.reply("❌ No active flirt girl raid")
+        flirt_girl_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Flirt girl raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active flirt girl raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_hindi_roast_boy_raid|shrbr)$"))
@@ -15875,8 +18168,10 @@ async def stop_hindi_roast_boy_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in hindi_roast_boy_raid_targets:
-        hindi_roast_boy_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Hindi roast boy raid stopped")
-    else: status_msg = await event.reply("❌ No active hindi roast boy raid")
+        hindi_roast_boy_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Hindi roast boy raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active hindi roast boy raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_hindi_roast_girl_raid|shrgr)$"))
@@ -15884,8 +18179,10 @@ async def stop_hindi_roast_girl_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in hindi_roast_girl_raid_targets:
-        hindi_roast_girl_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Hindi roast girl raid stopped")
-    else: status_msg = await event.reply("❌ No active hindi roast girl raid")
+        hindi_roast_girl_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Hindi roast girl raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active hindi roast girl raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_hindi_roast_abuse_raid|shrar)$"))
@@ -15893,8 +18190,10 @@ async def stop_hindi_roast_abuse_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in hindi_roast_abuse_raid_targets:
-        hindi_roast_abuse_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Hindi roast abuse raid stopped")
-    else: status_msg = await event.reply("❌ No active hindi roast abuse raid")
+        hindi_roast_abuse_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Hindi roast abuse raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active hindi roast abuse raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_hindi_flirt_girl_raid|shfgr)$"))
@@ -15902,8 +18201,10 @@ async def stop_hindi_flirt_girl_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in hindi_flirt_girl_raid_targets:
-        hindi_flirt_girl_raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Hindi flirt girl raid stopped")
-    else: status_msg = await event.reply("❌ No active hindi flirt girl raid")
+        hindi_flirt_girl_raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Hindi flirt girl raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active hindi flirt girl raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_raid100_raid|sr100r)$"))
@@ -15911,8 +18212,10 @@ async def stop_raid100_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in raid100_targets:
-        raid100_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Raid100 raid stopped")
-    else: status_msg = await event.reply("❌ No active raid100 raid")
+        raid100_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Raid100 raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active raid100 raid")
     await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(stop_raid_raid|srdr)$"))
@@ -15920,23 +18223,26 @@ async def stop_raid_raid_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if event.chat_id in raid_targets:
-        raid_targets.pop(event.chat_id); status_msg = await event.reply("🛑 Raid raid stopped")
-    else: status_msg = await event.reply("❌ No active raid raid")
+        raid_targets.pop(event.chat_id)
+        status_msg = await event.reply("🛑 Raid raid stopped")
+    else:
+        status_msg = await event.reply("❌ No active raid raid")
     await delete_after_delay(status_msg)
 
-# Auto-reply to targeted users
+
+# ==================== AUTO-REPLY HANDLER ====================
+
 @client.on(events.NewMessage)
 async def auto_reply_handler(event):
-    if not event.message or event.sender_id == OWNER_ID: return
-    chat_id = event.chat_id; sender_id = event.sender_id
+    if not event.message or event.sender_id == OWNER_ID:
+        return
+    chat_id = event.chat_id
+    sender_id = event.sender_id
     try:
-        # Existing raids
         if chat_id in reply_raid_targets and sender_id == reply_raid_targets[chat_id]:
             await event.reply(random.choice(reply_raid_lines))
         if chat_id in flirt_raid_targets and sender_id == flirt_raid_targets[chat_id]:
             await event.reply(random.choice(flirt_raid_lines))
-        
-        # New raids
         if chat_id in love_raid_targets and sender_id == love_raid_targets[chat_id]:
             await event.reply(random.choice(love_raid_lines))
         if chat_id in quote_raid_targets and sender_id == quote_raid_targets[chat_id]:
@@ -15967,9 +18273,12 @@ async def auto_reply_handler(event):
             await event.reply(random.choice(raid100_lines))
         if chat_id in raid_targets and sender_id == raid_targets[chat_id]:
             await event.reply(random.choice(raid_lines))
-    except: pass
+    except:
+        pass
 
-# 💖 ROMANCE COMMANDS - LONG + SHORT WITH @USERNAME SUPPORT
+
+# ==================== ROMANCE COMMANDS (MULTI-SESSION) ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(love|lv)\b"))
 async def love_handler(event):
     if not is_owner(event): return
@@ -15993,18 +18302,34 @@ async def mass_love_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     parts = event.raw_text.split()
-    count = 1; target_user = None
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(love_lines)}" if mention else random.choice(love_lines)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event)); ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```💖 Mass love started! {count} messages```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```💖 Mass love started! {count} messages```")
+    await delete_after_delay(status_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(shayari|shr)\b"))
 async def shayari_handler(event):
@@ -16020,47 +18345,127 @@ async def raid_shayari_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     parts = event.raw_text.split()
-    count = 1; target_user = None
+    count = 1
+    target_user = None
+    
     if len(parts) >= 2:
         if parts[-1].isdigit():
             count = min(int(parts[-1]), MAX_PER_RUN)
-            if len(parts) > 2: target_user = await get_target_user(event, parts[:-1])
-        else: target_user = await get_target_user(event, parts)
+            if len(parts) > 2:
+                target_user = await get_target_user(event, parts[:-1])
+        else:
+            target_user = await get_target_user(event, parts)
+    
     mention = await get_target_mention(event, parts)
     msgs = [(f"{mention} {random.choice(shayari_lines)}" if mention else random.choice(shayari_lines)) for _ in range(count)]
-    prev = ongoing_tasks.get(event.chat_id)
-    if prev and not prev.done(): prev.cancel()
-    task = asyncio.create_task(send_loop(event.chat_id, msgs, event)); ongoing_tasks[event.chat_id] = task
-    status_msg = await event.reply(f"```📜 Shayari raid started! {count} messages```"); await delete_after_delay(status_msg)
+    
+    _client = event.client
+    cid = id(_client)
+    
+    if cid not in ongoing_tasks:
+        ongoing_tasks[cid] = {}
+    
+    prev = ongoing_tasks[cid].get(event.chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+    
+    task = asyncio.create_task(send_loop(event.chat_id, msgs, event, _client))
+    ongoing_tasks[cid][event.chat_id] = task
+    status_msg = await event.reply(f"```📜 Shayari raid started! {count} messages```")
+    await delete_after_delay(status_msg)
 
-# 👥 SPECIAL FEATURES - LONG + SHORT
+
+# ==================== CLONE COMMANDS ====================
+
 @client.on(events.NewMessage(pattern=r"^\.(clone|cl)\b"))
 async def clone_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     target_user = await get_target_user(event, event.raw_text.split())
     if not target_user:
-        status_msg = await event.reply("❌ Reply to user or use @username"); await delete_after_delay(status_msg); return
+        status_msg = await event.reply("❌ Reply to user or use @username")
+        await delete_after_delay(status_msg)
+        return
     if target_user.id == OWNER_ID:
-        status_msg = await event.reply("❌ Can't clone yourself!"); await delete_after_delay(status_msg); return
+        status_msg = await event.reply("❌ Can't clone yourself!")
+        await delete_after_delay(status_msg)
+        return
     cloning_msg = await event.reply("🔄 Cloning profile...")
     success = await clone_profile(target_user)
     if success:
         cloned_bio = user_clones[OWNER_ID]['target_bio']
         await cloning_msg.edit(f"```✅ **Profile Cloned!**\n\n👤 Now: **{target_user.first_name}**\n📝 Bio: {cloned_bio if cloned_bio else 'No bio'}\n🖼️ PFP: ✅ Cloned\n\nUse `.unclone` to restore.```")
         await delete_after_delay(cloning_msg, 3)
-    else: await cloning_msg.edit("❌ Clone failed!"); await delete_after_delay(cloning_msg)
+    else:
+        await cloning_msg.edit("❌ Clone failed!")
+        await delete_after_delay(cloning_msg)
 
 @client.on(events.NewMessage(pattern=r"^\.(unclone|ucl)$"))
 async def unclone_handler(event):
     if not is_owner(event): return
     await delete_command_message(event)
     if OWNER_ID not in user_clones:
-        status_msg = await event.reply("❌ No active clone"); await delete_after_delay(status_msg); return
+        status_msg = await event.reply("❌ No active clone")
+        await delete_after_delay(status_msg)
+        return
     restoring_msg = await event.reply("🔄 Restoring profile...")
     success = await restore_original_profile()
-    if success: await restoring_msg.edit("✅ **Profile Restored!**"); await delete_after_delay(restoring_msg, 3)
-    else: await restoring_msg.edit("❌ Restore failed!"); await delete_after_delay(restoring_msg)
+    if success:
+        await restoring_msg.edit("✅ **Profile Restored!**")
+        await delete_after_delay(restoring_msg, 3)
+    else:
+        await restoring_msg.edit("❌ Restore failed!")
+        await delete_after_delay(restoring_msg)
+        
+@client.on(events.NewMessage(pattern=r"^\.(stop_all|sa)$"))
+async def stop_all_handler(event):
+    if not is_owner(event): return
+    await delete_command_message(event)
+    
+    stopped_count = 0
+    total_tasks = 0
+    
+    # Loop through all clients
+    for cid in list(ongoing_tasks.keys()):
+        for chat_id in list(ongoing_tasks[cid].keys()):
+            task = ongoing_tasks[cid].get(chat_id)
+            total_tasks += 1
+            if task and not task.done():
+                task.cancel()
+                stopped_count += 1
+        ongoing_tasks[cid].clear()
+    
+    ongoing_tasks.clear()
+    
+    # Also clear all raid targets
+    global reply_raid_targets, flirt_raid_targets, love_raid_targets, quote_raid_targets
+    global mass_love_raid_targets, shayari_raid_targets, raid_shayari_targets
+    global roast_boy_raid_targets, roast_girl_raid_targets, roast_abuse_raid_targets
+    global flirt_girl_raid_targets, hindi_roast_boy_raid_targets, hindi_roast_girl_raid_targets
+    global hindi_roast_abuse_raid_targets, hindi_flirt_girl_raid_targets, raid100_targets, raid_targets
+    global again_raid_users
+    
+    reply_raid_targets.clear()
+    flirt_raid_targets.clear()
+    love_raid_targets.clear()
+    quote_raid_targets.clear()
+    mass_love_raid_targets.clear()
+    shayari_raid_targets.clear()
+    raid_shayari_targets.clear()
+    roast_boy_raid_targets.clear()
+    roast_girl_raid_targets.clear()
+    roast_abuse_raid_targets.clear()
+    flirt_girl_raid_targets.clear()
+    hindi_roast_boy_raid_targets.clear()
+    hindi_roast_girl_raid_targets.clear()
+    hindi_roast_abuse_raid_targets.clear()
+    hindi_flirt_girl_raid_targets.clear()
+    raid100_targets.clear()
+    raid_targets.clear()
+    again_raid_users.clear()
+    
+    status_msg = await event.reply(f"```🛑 STOPPED EVERYTHING!\n\n✅ Active Tasks Stopped\n✅ All Raids Cleared:\n✅ Again Raids Cleared\n\nAll processes terminated!```")
+    await delete_after_delay(status_msg, 5)
 
 # 🏷 TAGGING COMMANDS - LONG + SHORT
 @client.on(events.NewMessage(pattern=r"^\.(mass_tag|mtag|mt)\b"))
@@ -16328,7 +18733,7 @@ async def help_main_menu(event):
 ┃
 ┃    ⟡➣ PAGE 9 - MUSIC COMMANDS                   
 ┃        .help9 - VC MUSIC PLAYING, VIDEO PLAYING                      
-╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯```
+╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯```
 """
     await event.reply(main_menu)
 
@@ -16625,10 +19030,128 @@ async def help_page9(event):
 ┃    ⟡➣ .pause - Pause music   
 ┃    ⟡➣ .resume - Resume music 
 ┃                              
-┃    Navigate: .help8 (Prev) | .help (Menu)
+┃    Navigate: .help8 (Prev) | .help10 (Next)
 ╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯```
 """
     await event.reply(page9)
+    
+@client.on(events.NewMessage(pattern=r"^\.help10$"))
+async def help_page10(event):
+    if not is_owner(event): return
+    await delete_command_message(event)
+    page10 = """
+```╭━━━━━━━━━━━⟬🎮 FUN COMMANDS⟭━━━━━━━━━━╮
+┃                              
+┃    🎲 Fun & Games            
+┃    ⟡➣ .truth - Random truth  
+┃    ⟡➣ .dare - Random dare    
+┃    ⟡➣ .shayari - Hindi shayari
+┃    ⟡➣ .oof - Oof animation   
+┃    ⟡➣ .lorem [n] - Lorem text
+┃    ⟡➣ .gif [query] - Search GIF      
+┃    ⟡➣ .uwu - UWU-ify text    
+┃    ⟡➣ .mock - mOcK tExT      
+┃    ⟡➣ .mockt - mOcK aLtErNaTe
+┃    ⟡➣ .reverse - Reverse text
+┃    ⟡➣ .vapor - Vaporwave text
+┃    ⟡➣ .weebify - Japanese style
+┃    ⟡➣ .flip - Flip upside down           
+┃    ⟡➣ .define [word] - Meaning
+┃    ⟡➣ .ud [word] - Urban Dict         
+┃    ⟡➣ .lyrics [song] - Search
+┃    ⟡➣ .l [song] - Alias      
+┃    ⟡➣ .paste [text] - Nekobin
+┃    ⟡➣ .wordcount - Chat stats              
+┃    ⟡➣ .eval [code] - Python  
+┃    ⟡➣ .exec [cmd] - Shell    
+┃                              
+┃    Navigate: .help9 (Prev) | .help (Menu)
+╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯```
+"""
+    await event.reply(page10)
+    
+@client.on(events.NewMessage(pattern=r"^\.help11$"))
+async def help_page11(event):
+    if not is_owner(event): return
+    await delete_command_message(event)
+    page11 = """
+```╭━━━━━━━━━━━⟬💰 CRYPTO & STATS⟭━━━━━━━━━━━━━╮
+┃                              
+┃    💰 Crypto Commands        
+┃    ⟡➣ .crypto BTC - Bitcoin price
+┃    ⟡➣ .crypto ETH - Ethereum price
+┃    ⟡➣ .crypto TON - Toncoin price
+┃    ⟡➣ .crypto BNB - Binance Coin
+┃    ⟡➣ .crypto SOL - Solana price
+┃    ⟡➣ .crypto LTC - Litecoin price
+┃    ⟡➣ .crypto DOGE - Dogecoin
+┃    ⟡➣ .crypto XRP - Ripple
+┃    ⟡➣ .crypto ADA - Cardano
+┃    ⟡➣ .crypto DOT - Polkadot
+┃                              
+┃    📊 Stats Commands         
+┃    ⟡➣ .topmembers [n] - Active members
+┃    ⟡➣ .topchats [n] - Active groups
+┃    ⟡➣ .topwords [n] - Most used words
+┃    ⟡➣ .usercount - Total users count
+┃    ⟡➣ .activity [days] - Activity graph
+┃    ⟡➣ .firstmessage - First message
+┃    ⟡➣ .lastseen @user - User status
+┃                              
+┃    💡 Usage Examples:        
+┃    ⟡➣ .crypto BTC            
+┃    ⟡➣ .crypto ETH (reply msg) 
+┃    ⟡➣ .topmembers 15         
+┃    ⟡➣ .activity 7            
+┃    ⟡➣ .lastseen @username    
+┃                              
+┃    50+ Coins Supported!      
+┃    Navigate: .help12 (Next)
+╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯```
+"""
+    await event.reply(page11)
+    
+@client.on(events.NewMessage(pattern=r"^\.help12$"))
+async def help_page12(event):
+    if not is_owner(event): return
+    await delete_command_message(event)
+    page12 = """
+```╭━━━━━━━━⟬🔄 FILE CONVERTER⟭━━━━━━━━━━╮
+┃                              
+┃    📄 Image Converters       
+┃    ⟡➣ .2pdf - Image to PDF    
+┃    ⟡➣ .2jpg - Image to JPG    
+┃    ⟡➣ .2png - Image to PNG    
+┃    ⟡➣ .2webp - Image to WebP  
+┃                              
+┃    🎬 Video Converters       
+┃    ⟡➣ .2mp3 - Video to Audio 
+┃    ⟡➣ .2mp4 - Video to MP4   
+┃    ⟡➣ .2gif - Video to GIF   
+┃                              
+┃    🗜️ Compression            
+┃    ⟡➣ .compress [1-100] - File
+┃                              
+┃    📚 PDF Tools              
+┃    ⟡➣ .mergepdf - Images to PDF
+┃    ⟡➣ .splitpdf [n] - Split PDF
+┃                              
+┃    💡 Usage Examples:        
+┃    ⟡➣ Reply to image + .2pdf  
+┃    ⟡➣ Reply to video + .2mp3  
+┃    ⟡➣ Reply to media + .compress 50
+┃    ⟡➣ Reply to album + .mergepdf
+┃    ⟡➣ Reply to PDF + .splitpdf 2
+┃                              
+┃    ⚙️ Requirements:          
+┃    • ffmpeg (for video)      
+┃    • img2pdf, PyPDF2, Pillow 
+┃                              
+┃    Navigate: .help (Main Menu)
+╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯```
+"""
+    await event.reply(page12)
+    
 # QUICK HELP - For quick reference
 @client.on(events.NewMessage(pattern=r"^\.quickhelp$"))
 async def quick_help(event):
@@ -16701,21 +19224,31 @@ async def start_handler(event):
 async def main():
     global bot_start_time
     bot_start_time = datetime.now()
-    print("Starting userbot...")
-    await client.start()
-    global OWNER_ID  # IMPORTANT: Global declare karein
-    me = await client.get_me()
-    OWNER_ID = me.id  # Yahan assign karein
-    #fake web server
+    
+    print(f"🚀 Starting {len(clients)} sessions...")
+ 
+    # Sabhi clients ko start karo
+    for i, c in enumerate(clients):
+        await c.start()
+        me = await c.get_me()
+        print(f"  ✅ Session {i+1} logged in as: {me.first_name} ({me.id})")
+ 
+    # Sabhi sessions pe handlers register karo
+    register_all_handlers()
+ 
+    # Web server start karo (sirf ek baar)
     await start_web_server()
-    me = await client.get_me()
-    print(f"Logged in as: {me.first_name} ({me.id})")
+ 
+    print(f"\n✅ All {len(clients)} sessions running! Owner ID: {OWNER_ID}")
     print("Muted list:", muted)
-    # run until disconnected
-    await client.run_until_disconnected()
+ 
+    # Sabhi clients ko saath mein run karo
+    await asyncio.gather(
+        *[c.run_until_disconnected() for c in clients]
+    )
 
 if __name__ == "__main__":
     try:
-        client.loop.run_until_complete(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("Stopped by user.")
