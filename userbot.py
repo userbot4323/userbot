@@ -108,6 +108,11 @@ SESSION_STRINGS = [
     "1BVtsOMIBu3sM2unlAFJGE2abqyQsv7M0IQvlgP09EZIJLYtE-zvE4Nfqzpwi4Ur3P7VPU1T4r_67dxYoOXPby5sCx2yUlWFR9H8zrYsiEE1RMXUA3xObihNtLQjRec9XX0QtiAWVsXLY0eeEfkOIyn4gk6zmrDI5C97PEJmWHoU-26qdE5C9tuoyvctfG38ierxC66NQAFU2TroYNSPaY_u1GsOubQME_95d7Gq_frbbU4PNpAzIcIPNo-2hUaXzXm25W4RitGYGjEl0XFb1yY7-sAzXPfq72OkoB-t6hTjfQN31JlcEjbXeeakaMoQ83N0PTnVNbOnZ4cCUfBdS0-IsyIGDNjc=",
     "1BVtsOMIBuzGaOoBgJB66wUdRwTmNCcxAXsKq53ZFMxRLK1VuVSqcG44XFnq1Dj47GG2LCqSWRsc-6EGKBkqalUUnYIQm_xF14w1kPftKI6plCQFvHZQWM_dXuCm8ThztUe0Nl1lCaaX-RxbLdnV4tEZ4_Y0dJd6RWoe8lYbCfJfU-Umte4bndb0yxe4IiXc8Azj6GyRgtF4mz2Weni6a7YHNsSuIa5XiBBegA93cq2Rz4nzpggINj5MsaKD7qTIJtHgJcoqf7AQfalghEnCStJEMM-CzsodNGdwOk1Kffi0CCRYQBKEtSKQ6B6niVM8fv9Tjn9CGm7XNq7EiZuRrMlVObvCaa6E=",
 ]
+GBAN_FILE      = "gban_list.json"
+STORAGE_FILE   = "user_replies.json"
+PORT           = 10000
+os.environ["PATH"] += r";C:\ffmpeg\bin"
+os.environ["PATH"] += r";C:\ffprobe\bin"
 
 # Clients bana session strings se
 clients = [
