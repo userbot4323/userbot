@@ -11,5 +11,6 @@ qrcode
 aiohttp
 requests
 psutil
+pytz
 numpy
 pyfiglet
