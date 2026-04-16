@@ -99,30 +99,23 @@ API_HASH       = "38a5463cb8bf980d4519fba0ced298c2"
 OWNER_ID       = 6105009337
 MUTED_FILE     = "muted.json"
 STATE_FILE     = "state.json"
-SESSION_NAMES = [
-    "session1",   # Pehla account
-    "session2",   # Doosra account
-    "session3",
-    "session4",
-    "session5",
-    "session6",
-    "session7",
-    "session8"
+# Session strings for multiple accounts
+SESSION_STRINGS = [
+    "1BJWap1sBu0Dwl81LKsTiDHu8Wv_8vEiSp9Rj2cxD9uJCkjRVfS_zVWDWo9fkKH0AdrYAmXddsHaTf7hsdoo1SOnPaW1u7yj0Bs94IuSF7-CXR-vtMJ3Dm5X-HDoxC_P54W9qkiQUgH2ItrpwJY1UKBOTLPFkmQ6ZlWr_tZTfCCUiTQ066InFv7q_zFbF5DJO3i4jZeu3pJP7MxTMFXPOKRnVRqHkC6EzxQ7qXOdWP_vY24qUx7qQa0rTLTC5aHbKGk1yTk4qSNcWA8q0sNS70M0gUDvuL41m6CXnFE-iGORD9tw9L9f33jVmylAhaVh-imBBckZhyTrUaPqMdkt4yFeQRAwhrm4=",  # Account 1
+    "1BJWap1sBu600nM4gPlFj5W0F3ZTwYwXmp_TVA2OPpzGwTma3hk00NtWRAENS0HKI55WvJ9K4vzq72X_pQDEHJ2U3jLjtOyZMx6GMN3gn2vkbAlswoIbbon8Snp0Of-cf3Z00y_JE2WkI6fTl7qXZfubJXyrHwK4jDNKmEhXvBRr09xZfmF7G94-DJVAUUjC-BLtXHOfjtHY4D9uINC-RlHgg53Uq0n_rJIDuIRVHbXyOW14dj1L_4RTYSBLgxHp3nXu5m2X9JoMbG6ojZqfrubzb-IOn5EFUGg0SecfDdRrSPG-kfTab5Tj1yz0xUs48_m0eol1sRUza_WP0_qw5BCwYFqDNFGo=",  # Account 2
+    "1BVtsOMIBu68F7BoXUjwJRmAYZO9cuxkEbcF-o9JXYZX6jKIYOFPqRj6jf8PWiAxUF9OrIdjTZzQjlIPwbyG9B8Hd__2OpeNOCYD-tOSieLJgcA1-PkqoL6N20FSsH5dYjRAqr0uxHgxhTGjkiKVO8VybJoZolcrxcPSIH7mP-SVbgnChnPFxmv1yeDN9nCD5bTj2VAASgGnU77e0MEi8pUofX-mNWx-vmA4m3uofXtIjksn3NculM6el4ucyGkxJm0rJpf4L1jY6IJBNeCu10ALke6WsD2y535kA2QPrEJktowSqNjHMSgWCmmqkCZ6agP-r6OtJKw4Fdq9ZoADc3evJZ0AxgYo=",  # Account 3
+    "1BVtsOMIBuw9IVCigMGG5iv8zcA4XVs0TqY79aFncS8WZixppXxciigwb7V-f0k8-KnKmSOFTzOc3RinvEaOBBYH9NcZ3An5MYAeL42sTSYFirX2TiCzojBQ_npT9neORNFI1vzsnV8Qk35-PEWqSsA6SendPw3VVBnmYrhkicfKurJIGJHrW29gNlMHwj36gZbM1XpsrQgtZzHdf4RTq0TcgG_gjeMHX4ngt64YldYq19oAQ5A4YcQmAReV0SvTojtMpKaH_cVMou1I98zfYRqqC1BBMsuti47W5kaJRddP4YiZCkWD1iiTN9irLrH44VRo-P7XxXI1nDJAdsRZIWNv2karM2r8=",
+    "1BVtsOMIBu3sM2unlAFJGE2abqyQsv7M0IQvlgP09EZIJLYtE-zvE4Nfqzpwi4Ur3P7VPU1T4r_67dxYoOXPby5sCx2yUlWFR9H8zrYsiEE1RMXUA3xObihNtLQjRec9XX0QtiAWVsXLY0eeEfkOIyn4gk6zmrDI5C97PEJmWHoU-26qdE5C9tuoyvctfG38ierxC66NQAFU2TroYNSPaY_u1GsOubQME_95d7Gq_frbbU4PNpAzIcIPNo-2hUaXzXm25W4RitGYGjEl0XFb1yY7-sAzXPfq72OkoB-t6hTjfQN31JlcEjbXeeakaMoQ83N0PTnVNbOnZ4cCUfBdS0-IsyIGDNjc=",
+    "1BVtsOMIBuzGaOoBgJB66wUdRwTmNCcxAXsKq53ZFMxRLK1VuVSqcG44XFnq1Dj47GG2LCqSWRsc-6EGKBkqalUUnYIQm_xF14w1kPftKI6plCQFvHZQWM_dXuCm8ThztUe0Nl1lCaaX-RxbLdnV4tEZ4_Y0dJd6RWoe8lYbCfJfU-Umte4bndb0yxe4IiXc8Azj6GyRgtF4mz2Weni6a7YHNsSuIa5XiBBegA93cq2Rz4nzpggINj5MsaKD7qTIJtHgJcoqf7AQfalghEnCStJEMM-CzsodNGdwOk1Kffi0CCRYQBKEtSKQ6B6niVM8fv9Tjn9CGm7XNq7EiZuRrMlVObvCaa6E=",
 ]
-GBAN_FILE      = "gban_list.json"
-STORAGE_FILE   = "user_replies.json"
-PORT           = 10000
-os.environ["PATH"] += r";C:\ffmpeg\bin"
-os.environ["PATH"] += r";C:\ffprobe\bin"
-# ------------------------------------------
 
+# Clients bana session strings se
 clients = [
-    TelegramClient(name, API_ID, API_HASH)
-    for name in SESSION_NAMES
+    TelegramClient(StringSession(s), API_ID, API_HASH)
+    for s in SESSION_STRINGS
 ]
- 
-# Pehla client default rakhte hain backward compatibility ke liye
-# (agar code mein kahi `client` directly use hua ho)
+
+# Pehla client default
 client = clients[0]
 
 def register_all_handlers():
